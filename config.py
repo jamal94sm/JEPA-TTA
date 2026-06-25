@@ -54,10 +54,6 @@ def get_cfg(args=None):
 
     # ─── Evaluation ───────────────────────────────────────────
     p.add_argument("--eval_every", type=int, default=5)
-    p.add_argument("--eval_lp_lr", type=float, default=1e-3,
-                   help="Linear probe learning rate")
-    p.add_argument("--eval_lp_epochs", type=int, default=50,
-                   help="Linear probe training epochs")
 
     # ─── Misc ─────────────────────────────────────────────────
     p.add_argument("--seed", type=int, default=2025)
