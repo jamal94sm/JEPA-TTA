@@ -73,24 +73,18 @@ def split_mode_all(samples, test_ratio=0.2, seed=2025):
     return train, {"all": test}
 
 
-def split_mode_cross_domain(samples, train_spectrums, test_ratio=0.2,
-                             seed=2025):
+def split_mode_cross_domain(samples, train_spectrums, seed=2025):
     """
     Mode 2: selected domains × all IDs.
-    Train on selected domains (80% of samples).
-    Eval on held-out 20% from training domains + all unseen domains.
-    Returns: train_samples, {"seen": test_seen, "460": [...], ...}
+    ALL training domain samples used for training (no held-out).
+    Eval on each unseen domain separately.
+    Returns: train_samples, {"460": [...], "630": [...], ...}
     """
-    rng = random.Random(seed)
     unseen_spectrums = [s for s in ALL_SPECTRUMS if s not in train_spectrums]
 
-    seen_samples = [s for s in samples if s["spectrum"] in train_spectrums]
-    rng.shuffle(seen_samples)
-    n_test = int(len(seen_samples) * test_ratio)
-    test_seen = seen_samples[:n_test]
-    train = seen_samples[n_test:]
+    train = [s for s in samples if s["spectrum"] in train_spectrums]
 
-    eval_sets = {"seen": test_seen}
+    eval_sets = {}
     for sp in unseen_spectrums:
         sp_samples = [s for s in samples if s["spectrum"] == sp]
         if sp_samples:
@@ -100,11 +94,12 @@ def split_mode_cross_domain(samples, train_spectrums, test_ratio=0.2,
 
 
 def split_mode_cross_domain_openset(samples, train_spectrums,
-                                     train_id_ratio=0.8, test_ratio=0.2,
-                                     seed=2025):
+                                     train_id_ratio=0.8, seed=2025):
     """
     Mode 3: selected domains × selected IDs.
-    4 evaluation sets: seen/unseen domain × seen/unseen IDs.
+    ALL training domain × training ID samples used for training.
+    3 evaluation sets: seen_dom×unseen_id, unseen_dom×seen_id,
+                       unseen_dom×unseen_id.
     Returns: train_samples, {eval_name: eval_samples, ...}
     """
     rng = random.Random(seed)
@@ -115,16 +110,12 @@ def split_mode_cross_domain_openset(samples, train_spectrums,
     unseen_ids = set(all_ids[n_train_ids:])
     unseen_spectrums = [s for s in ALL_SPECTRUMS if s not in train_spectrums]
 
-    # Training: seen domains × seen IDs
-    train_pool = [s for s in samples
-                  if s["spectrum"] in train_spectrums
-                  and s["identity"] in train_ids]
-    rng.shuffle(train_pool)
-    n_test = int(len(train_pool) * test_ratio)
-    test_seen_seen = train_pool[:n_test]
-    train = train_pool[n_test:]
+    # Training: ALL seen domains × seen IDs
+    train = [s for s in samples
+             if s["spectrum"] in train_spectrums
+             and s["identity"] in train_ids]
 
-    eval_sets = {"seen_dom_seen_id": test_seen_seen}
+    eval_sets = {}
 
     # Seen domain × unseen IDs
     seen_unseen = [s for s in samples
@@ -242,13 +233,12 @@ def build_datasets(cfg):
         info = "All domains × All IDs"
     elif cfg.mode == "cross_domain":
         train_samples, eval_sets = split_mode_cross_domain(
-            all_samples, cfg.train_spectrums,
-            cfg.test_sample_ratio, cfg.seed)
+            all_samples, cfg.train_spectrums, cfg.seed)
         info = f"Train domains: {cfg.train_spectrums}"
     elif cfg.mode == "cross_domain_openset":
         train_samples, eval_sets = split_mode_cross_domain_openset(
             all_samples, cfg.train_spectrums,
-            cfg.train_id_ratio, cfg.test_sample_ratio, cfg.seed)
+            cfg.train_id_ratio, cfg.seed)
         info = (f"Train domains: {cfg.train_spectrums}, "
                 f"Train ID ratio: {cfg.train_id_ratio}")
 
@@ -272,9 +262,6 @@ def build_datasets(cfg):
 
     eval_dict = {}
     for name, samples in eval_sets.items():
-        ds = CASIADataset(samples, id_map, cfg.img_size, augment=False)
-        loader = DataLoader(ds, batch_size=cfg.batch_size, shuffle=False,
-                            num_workers=cfg.num_workers)
         gal_samples, prb_samples = split_gallery_probe(
             samples, id_map, cfg.gallery_ratio, cfg.seed)
         gal_ds = CASIADataset(gal_samples, id_map, cfg.img_size, augment=False)
@@ -284,7 +271,6 @@ def build_datasets(cfg):
         prb_loader = DataLoader(prb_ds, batch_size=cfg.batch_size,
                                 shuffle=False, num_workers=cfg.num_workers)
         eval_dict[name] = {
-            "loader": loader,
             "gallery_loader": gal_loader,
             "probe_loader": prb_loader,
             "n_samples": len(samples),
