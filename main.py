@@ -184,7 +184,7 @@ def main():
             print(f"\n  ── Eval at epoch {epoch} ──")
             context_encoder.eval()
             eval_results = run_full_eval(
-                feature_extractor, eval_dict, n_classes, cfg,
+                feature_extractor, eval_dict, cfg,
                 tag=f"[ep{epoch}] ")
 
             eval_entry = {"epoch": epoch, "loss": ep_loss, "sim": sim}
@@ -224,11 +224,11 @@ def main():
     print(f"\n  {'Epoch':>6} {'Loss':>8} {'Sim':>6}", end="")
     eval_names = list(eval_dict.keys())
     for name in eval_names:
-        print(f" │ {name[:12]:>12} R1   EER   LP", end="")
+        print(f" │ {name[:12]:>12} R1   EER", end="")
     print()
     print(f"  {'─'*8}{'─'*8}{'─'*6}", end="")
     for _ in eval_names:
-        print(f"─┼─{'─'*30}", end="")
+        print(f"─┼─{'─'*24}", end="")
     print()
 
     for entry in eval_history:
@@ -237,10 +237,9 @@ def main():
         for name in eval_names:
             if name in entry:
                 r = entry[name]
-                print(f" │ {r['rank1']:>6.2f} {r['eer']:>6.2f} "
-                      f"{r['lp_acc']:>6.2f}", end="")
+                print(f" │ {r['rank1']:>6.2f} {r['eer']:>6.2f}", end="")
             else:
-                print(f" │ {'---':>6} {'---':>6} {'---':>6}", end="")
+                print(f" │ {'---':>6} {'---':>6}", end="")
         print()
 
     # Save results
