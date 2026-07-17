@@ -8,7 +8,12 @@ def get_cfg(args=None):
     p = argparse.ArgumentParser(description="JEPA on CASIA-MS")
 
     # ─── Dataset ──────────────────────────────────────────────
-    p.add_argument("--data_dir", required=True)
+    
+    #"data_root"        : "/home/pai-ng/Jamal/CASIA-MS-ROI",
+    #"xjtu_data_root"   : "/home/pai-ng/Jamal/XJTU-UP",
+    #"xpalm_data_root"  : "/home/pai-ng/Jamal/xpalm",
+    
+    p.add_argument("--data_dir", required=True, default = "/home/pai-ng/Jamal/CASIA-MS-ROI")
     p.add_argument("--img_size", type=int, default=112)
 
     # ─── Mode ─────────────────────────────────────────────────
