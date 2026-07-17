@@ -25,7 +25,7 @@ def get_cfg(args=None):
                    help="Fraction of training samples held out for eval")
     p.add_argument("--gallery_ratio", type=float, default=0.5,
                    help="Fraction of test samples used as gallery")
-    p.add_argument("--aug_multiplier", type=int, default=4,
+    p.add_argument("--aug_multiplier", type=int, default=8,
                    help="Augmentation multiplier for training data")
 
     # ─── JEPA architecture ────────────────────────────────────
