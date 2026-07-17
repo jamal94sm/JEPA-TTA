@@ -22,6 +22,9 @@ from models import (ContextEncoder, TargetEncoder, Predictor,
                     repeat_interleave_batch, update_ema)
 from evaluate import run_full_eval
 
+from torch.utils.data import DataLoader
+from dataset import build_datasets, CASIADataset
+
 
 def set_seed(seed):
     random.seed(seed)
@@ -45,7 +48,15 @@ def main():
     print(f"{'='*80}\n")
 
     os.makedirs(cfg.output_dir, exist_ok=True)
-
+  
+    # ── Source checkpoint name ──
+    ds_name = os.path.basename(os.path.normpath(cfg.data_dir))
+    domains = "all" if cfg.mode == "all" else "-".join(cfg.train_spectrums)
+    ckpt_name = (f"ckpt_source_{ds_name}_{cfg.mode}_{domains}_"
+                 f"{cfg.aug_multiplier}x.pth")
+    ckpt_path = os.path.join(cfg.output_dir, ckpt_name)
+    print(f"  Source checkpoint → {ckpt_path}")
+  
     # ── Build datasets ──
     train_loader, eval_dict, id_map, n_classes = build_datasets(cfg)
     img_size = (cfg.img_size, cfg.img_size)
@@ -106,8 +117,8 @@ def main():
     feature_extractor = FeatureExtractor(context_encoder)
     global_step = 0
     eval_history = []
-    best_eval = {"epoch": 0, "mean_rank1": 0}
-
+    best_eval = {"epoch": 0, "mean_rank1": 0.0, "mean_eer": float("inf")}
+  
     for epoch in range(1, cfg.epochs + 1):
         context_encoder.train()
         predictor.train()
@@ -196,23 +207,80 @@ def main():
                 eval_entry[name] = r
             eval_history.append(eval_entry)
 
-            if mean_r1 > best_eval["mean_rank1"]:
+            if mean_eer < best_eval["mean_eer"]:          # ← min EER now
                 best_eval = {"epoch": epoch, "mean_rank1": mean_r1,
                              "mean_eer": mean_eer}
-                ckpt_path = os.path.join(cfg.output_dir, "best.pth")
                 torch.save({
                     "epoch": epoch,
                     "context_encoder": context_encoder.state_dict(),
                     "target_encoder": target_encoder.state_dict(),
                     "predictor": predictor.state_dict(),
                     "mean_rank1": mean_r1,
+                    "mean_eer": mean_eer,                 # ← best EER saved
+                    "arch": {                             # ← needed to rebuild
+                        "img_size":    cfg.img_size,
+                        "num_patches": cfg.num_patches,
+                        "embed_dim":   cfg.embed_dim,
+                    },
+                    "mode": cfg.mode,
+                    "train_spectrums": cfg.train_spectrums,
+                    "aug_multiplier": cfg.aug_multiplier,
+                    "seed": cfg.seed,
                 }, ckpt_path)
-                print(f"    ★ New best R1={mean_r1:.2f}% "
-                      f"EER={mean_eer:.2f}% → saved")
+                print(f"     New best EER={mean_eer:.2f}% "
+                      f"(R1={mean_r1:.2f}%) → saved")
 
-            print(f"    Summary: Mean R1={mean_r1:.2f}% | "
-                  f"Mean EER={mean_eer:.2f}%\n")
+  
+    # ══════════════════════════════════════════════════════════════
+    #  Source subspace C0 — BEST weights, clean data, single pass
+    # ══════════════════════════════════════════════════════════════
+    print(f"\n{'─'*70}")
+    print(f"  Computing C0 with best model (epoch {best_eval['epoch']}, "
+          f"EER={best_eval['mean_eer']:.2f}%)")
+    print(f"{'─'*70}")
 
+    # 1. restore BEST weights — final-epoch weights are not the ones we ship
+    ckpt = torch.load(ckpt_path, map_location=cfg.device, weights_only=False)
+    context_encoder.load_state_dict(ckpt["context_encoder"])
+    context_encoder.eval()
+    feature_extractor = FeatureExtractor(context_encoder)
+
+    # 2. clean loader: no augmentation, no shuffle, no dropped samples
+    src_ds = train_loader.dataset                    # CASIADataset(augment=True)
+    c0_ds = CASIADataset(src_ds.samples, src_ds.id_map, cfg.img_size,
+                         augment=False, aug_multiplier=1)
+    c0_loader = DataLoader(c0_ds, batch_size=cfg.batch_size, shuffle=False,
+                           num_workers=cfg.num_workers, drop_last=False)
+
+    # 3. accumulate the uncentered scatter (exact: batching is just reordering)
+    d = cfg.embed_dim
+    C0 = torch.zeros(d, d, dtype=torch.float64, device=cfg.device)
+    n_feat = 0
+    with torch.no_grad():
+        for images, _ in c0_loader:
+            x = feature_extractor(images.to(cfg.device))      # [B, d]
+            # x = F.normalize(x, dim=-1)    # ← ONLY if NS-CTTA uses normalized x
+            x = x.double()
+            C0 += x.T @ x
+            n_feat += x.size(0)
+    C0 /= max(n_feat, 1)
+    print(f"  C0 from {n_feat} clean source samples")
+
+    # 4. diagnostic: how much of the d-dim space does the source occupy?
+    ev = torch.linalg.eigvalsh(C0.cpu()).flip(0)     # descending
+    for tau in [0.5, 0.1, 0.05, 0.01, 1e-3]:
+        r0 = int((ev > tau * ev[0]).sum())
+        print(f"    tau_eig={tau:<6} → r_0={r0:3d}/{d}   free={d-r0:3d}")
+
+    # 5. attach C0 to the same checkpoint
+    ckpt["C0"] = C0.cpu().float()
+    ckpt["n_feat"] = n_feat
+    ckpt["c0_augment"] = False
+    ckpt["c0_normalized"] = False       # keep in sync with the F.normalize line
+    torch.save(ckpt, ckpt_path)
+    print(f"\n  Saved source model + C0 → {ckpt_path}")
+
+  
     # ── Final summary ──
     print(f"\n{'='*80}")
     print(f"  TRAINING COMPLETE")
