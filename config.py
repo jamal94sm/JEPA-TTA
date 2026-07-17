@@ -58,7 +58,7 @@ def get_cfg(args=None):
     p.add_argument("--ema_end", type=float, default=1.0)
 
     # ─── Evaluation ───────────────────────────────────────────
-    p.add_argument("--eval_every", type=int, default=5)
+    p.add_argument("--eval_every", type=int, default=10)
 
     # ─── Misc ─────────────────────────────────────────────────
     p.add_argument("--seed", type=int, default=2025)
