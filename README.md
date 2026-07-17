@@ -3,6 +3,7 @@ nohup python main.py --mode cross_domain_openset --data_dir "/home/pai-ng/Jamal/
 
 
 subspace_analysis.py :
+
 Characterizes the source model's feature subspace from a trained JEPA checkpoint, offline and without further training. Given a checkpoint and the dataset directory, it rebuilds the frozen encoder, builds the source feature covariance C0=UΛU⊤C_0 = U\Lambda U^\top
 C0​=UΛU⊤ from the gallery split, and runs four analyses: retention (keep top-kk
 k directions → find k⋆k^\star
