@@ -280,3 +280,45 @@ def build_datasets(cfg):
         }
 
     return train_loader, eval_dict, id_map, n_classes
+
+# ========================================================
+XJTU-UP dataset
+# ============================================================
+
+def scan_xjtu(data_root):
+    """Load XJTU-UP as CASIA-style sample dicts so the rest of the pipeline
+       (CASIADataset, split_gallery_probe, build_id_map) consumes it unchanged.
+
+       Directory layout:  data_root / <device> / <condition> / <id_folder> / *.img
+       where <id_folder> looks like 'L_003' or 'R_012' (hand_subject).
+
+       XJTU has no spectrum, so every sample is tagged spectrum='XJTU' and reads
+       as ONE target domain. Identities are namespaced 'XJTU_<id_folder>' so they
+       can never collide with CASIA identities in a shared id_map.
+    """
+    IMG_EXTS = (".jpg", ".jpeg", ".png", ".bmp")
+    samples = []
+    ids = set()
+    for device in sorted(os.listdir(data_root)):
+        dev_dir = os.path.join(data_root, device)
+        if not os.path.isdir(dev_dir):
+            continue
+        for condition in sorted(os.listdir(dev_dir)):
+            cond_dir = os.path.join(dev_dir, condition)
+            if not os.path.isdir(cond_dir):
+                continue
+            for id_folder in sorted(os.listdir(cond_dir)):
+                id_dir = os.path.join(cond_dir, id_folder)
+                if not os.path.isdir(id_dir):
+                    continue
+                identity = f"XJTU_{id_folder}"
+                for fname in sorted(os.listdir(id_dir)):
+                    if fname.lower().endswith(IMG_EXTS):
+                        samples.append({
+                            "path": os.path.join(id_dir, fname),
+                            "identity": identity,
+                            "spectrum": "XJTU",
+                        })
+                        ids.add(identity)
+    print(f"  [XJTU] {len(samples)} samples, {len(ids)} identities from {data_root}")
+    return samples
