@@ -46,7 +46,7 @@ from models import ContextEncoder, FeatureExtractor
 from dataset import (scan_dataset, build_id_map, split_gallery_probe,
                      CASIADataset)
 from evaluate import evaluate_rank1_eer
-
+from dataset import scan_xjtu
 
 # ══════════════════════════════════════════════════════════════
 #  Args
@@ -69,6 +69,9 @@ def get_args():
     p.add_argument("--img_size", type=int, default=None)
     p.add_argument("--num_patches", type=int, default=None)
     p.add_argument("--embed_dim", type=int, default=None)
+    p.add_argument("--target_dataset", default="casia",
+                   choices=["casia", "xjtu"])
+    p.add_argument("--xjtu_root", default="/home/pai-ng/Jamal/XJTU-UP")
     return p.parse_args()
 
 
@@ -205,7 +208,16 @@ def main():
     all_samples = scan_dataset(args.data_dir)
     id_map = build_id_map(all_samples)
     src = [s for s in all_samples if s["spectrum"] == args.source_spectrum]
-    tgt = [s for s in all_samples if s["spectrum"] == args.target_spectrum]
+    #tgt = [s for s in all_samples if s["spectrum"] == args.target_spectrum]
+    if args.target_dataset == "xjtu":
+        tgt = scan_xjtu(args.xjtu_root, seed=args.seed)
+        # XJTU identities must join the SAME id_map used for source splitting
+        id_map = build_id_map(all_samples + tgt)
+        tgt_name = "XJTU"
+    else:
+        tgt = [s for s in all_samples if s["spectrum"] == args.target_spectrum]
+        tgt_name = args.target_spectrum
+      
     if not tgt:
         raise SystemExit(f"no target samples for {args.target_spectrum}")
     print(f"  source '{args.source_spectrum}': {len(src)}   "
