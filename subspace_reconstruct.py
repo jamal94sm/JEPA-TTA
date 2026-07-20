@@ -224,6 +224,8 @@ def main():
     ev_t, U_t, C_t = cov_eig(tg)
 
     # ── Signal B: reconstruction-error knee (label-free k selection) ──
+    ns = [k for k in [1, 2, 4, 8, 16, 24, 32, 48, 64, 96, 128, 192, 256]
+          if 1 <= k <= d]
     reconB = recon_error_curve(tg, U_t, ns)
     print(f"\n  ── Signal B: target reconstruction error vs k (label-free) ──")
     print(f"    {'k':>4} | {'recon_err':>10} {'energy_kept':>12}")
