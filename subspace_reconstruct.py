@@ -304,6 +304,31 @@ def main():
                   f"{r['rank1']:6.2f} {dr:+7.2f} | {ov:6.3f}")
     print(f"    k* (source preserved within tol) = {k_src_ok}")
 
+
+    # ── Calibration table: Signal B (label-free) vs source preservation ──
+    print(f"\n  ── CALIBRATION: target energy kept  vs  source model on source data ──")
+    print(f"     (energy_kept from TARGET basis U_t; EER/R1 = SOURCE data through U_t)")
+    print(f"     source baseline: EER={s_base['eer']:.2f}  R1={s_base['rank1']:.2f}")
+    print(f"    {'k':>4} | {'recon_err':>9} {'E_kept':>7} | "
+          f"{'srcEER':>7} {'dEER':>6} | {'srcR1':>7} {'dR1':>7}")
+    print(f"    {'-'*4}-+-{'-'*17}-+-{'-'*14}-+-{'-'*15}")
+    srcmap = {x["k"]: x for x in src_thru_tgt}          # index block C by k
+    for row in reconB:
+        k = row["k"]
+        s = srcmap.get(k)
+        if s is None:
+            continue
+        print(f"    {k:>4} | {row['recon_error']:9.4f} {row['energy_kept']:7.4f} | "
+              f"{s['eer']:7.2f} {s['d_eer']:+6.2f} | "
+              f"{s['rank1']:7.2f} {s['d_rank1']:+7.2f}")
+
+    # where does the energy knee land relative to source preservation?
+    for tol in (0.05, 0.02, 0.01):
+        kB = knee_from_curve(reconB, tol)
+        s = srcmap.get(kB, srcmap[min(srcmap, key=lambda kk: abs(kk - kB))])
+        print(f"    knee @ E_kept>={1-tol:.3f} -> k*_B={kB:<4d} "
+              f"(source there: dEER={s['d_eer']:+.2f}, dR1={s['d_rank1']:+.2f})")
+      
     # ══════════════════════════════════════════════════════════
     #  (D) SYMMETRIC: TARGET data through the SOURCE subspace
     #      lined up against (C) to test whether the damage is symmetric
