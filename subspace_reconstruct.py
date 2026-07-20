@@ -210,7 +210,7 @@ def main():
     src = [s for s in all_samples if s["spectrum"] == args.source_spectrum]
     #tgt = [s for s in all_samples if s["spectrum"] == args.target_spectrum]
     if args.target_dataset == "xjtu":
-        tgt = scan_xjtu(args.xjtu_root, seed=args.seed)
+        tgt = scan_xjtu(args.xjtu_root)
         # XJTU identities must join the SAME id_map used for source splitting
         id_map = build_id_map(all_samples + tgt)
         tgt_name = "XJTU"
