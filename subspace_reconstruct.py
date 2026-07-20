@@ -24,9 +24,10 @@ grade reconstruction. At deployment we would not have it.
 USAGE
 -----
 python subspace_reconstruct.py \
-    --data_dir /path/CASIA-MS-ROI \
-    --ckpt ./output_jepa/ckpt_source_XXX.pth \
-    --source_spectrum WHT --target_spectrum 940
+  --data_dir /home/pai-ng/Jamal/CASIA-MS-ROI \
+  --ckpt ./output_jepa/ckpt_source_..._WHT_8x.pth \
+  --source_spectrum WHT --target_dataset cifar --n_cifar 2000 \
+  --out_dir ./output_reconstruct/CIFAR
 """
 
 import os
@@ -70,7 +71,7 @@ def get_args():
     p.add_argument("--num_patches", type=int, default=None)
     p.add_argument("--embed_dim", type=int, default=None)
     p.add_argument("--target_dataset", default="casia",
-                   choices=["casia", "xjtu"])
+                   choices=["casia", "xjtu", "cifar"])
     p.add_argument("--xjtu_root", default="/home/pai-ng/Jamal/XJTU-UP")
     return p.parse_args()
 
@@ -209,6 +210,7 @@ def main():
     id_map = build_id_map(all_samples)
     src = [s for s in all_samples if s["spectrum"] == args.source_spectrum]
     #tgt = [s for s in all_samples if s["spectrum"] == args.target_spectrum]
+    '''
     if args.target_dataset == "xjtu":
         tgt = scan_xjtu(args.xjtu_root)
         # XJTU identities must join the SAME id_map used for source splitting
@@ -217,6 +219,16 @@ def main():
     else:
         tgt = [s for s in all_samples if s["spectrum"] == args.target_spectrum]
         tgt_name = args.target_spectrum
+    '''  
+    if args.target_dataset == "xjtu":
+        tgt = scan_xjtu(args.xjtu_root); tgt_name = "XJTU"
+    elif args.target_dataset == "cifar":
+        tgt = scan_cifar10(n_images=args.n_cifar); tgt_name = "CIFAR"
+    else:
+        tgt = [s for s in all_samples if s["spectrum"] == args.target_spectrum]
+        tgt_name = args.target_spectrum
+    if args.target_dataset in ("xjtu", "cifar"):
+        id_map = build_id_map(all_samples + tgt)
       
     if not tgt:
         raise SystemExit(f"no target samples for {args.target_spectrum}")
