@@ -48,6 +48,8 @@ from dataset import (scan_dataset, build_id_map, split_gallery_probe,
                      CASIADataset)
 from evaluate import evaluate_rank1_eer
 from dataset import scan_xjtu
+from dataset import scan_cifar10
+
 
 # ══════════════════════════════════════════════════════════════
 #  Args
