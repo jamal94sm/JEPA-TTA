@@ -225,7 +225,7 @@ def main():
     if args.target_dataset == "xjtu":
         tgt = scan_xjtu(args.xjtu_root); tgt_name = "XJTU"
     elif args.target_dataset == "cifar":
-        tgt = scan_cifar10(n_images=args.n_cifar); tgt_name = "CIFAR"
+        tgt = scan_cifar10(n_images=2000); tgt_name = "CIFAR"
     else:
         tgt = [s for s in all_samples if s["spectrum"] == args.target_spectrum]
         tgt_name = args.target_spectrum
