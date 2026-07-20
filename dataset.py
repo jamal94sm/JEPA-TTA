@@ -282,7 +282,7 @@ def build_datasets(cfg):
     return train_loader, eval_dict, id_map, n_classes
 
 # ========================================================
-XJTU-UP dataset
+#XJTU-UP dataset
 # ============================================================
 
 def scan_xjtu(data_root):
