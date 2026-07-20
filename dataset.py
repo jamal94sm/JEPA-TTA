@@ -322,3 +322,29 @@ def scan_xjtu(data_root):
                         ids.add(identity)
     print(f"  [XJTU] {len(samples)} samples, {len(ids)} identities from {data_root}")
     return samples
+
+
+def scan_cifar10(n_images=2000, root="./cifar_cache", seed=42):
+    """CIFAR-10 as CASIA-style sample dicts for a cross-DOMAIN (non-palmprint)
+       probe. Each image is its own 'identity' (biometric identity is undefined
+       here); spectrum tagged 'CIFAR'. Images are cached to disk as .png so the
+       existing CASIADataset (which does Image.open(path)) can read them."""
+    import torchvision
+    os.makedirs(root, exist_ok=True)
+    ds = torchvision.datasets.CIFAR10(root=root, train=True, download=True)
+    rng = random.Random(seed)
+    idxs = rng.sample(range(len(ds)), min(n_images, len(ds)))
+    samples = []
+    for count, i in enumerate(idxs):
+        img, label = ds[i]                       # PIL image, int label
+        # give each image a distinct identity so gallery/probe has >=2 per id:
+        # duplicate the SAME image path into gallery+probe by using its class as
+        # identity gives ~200/class; simplest is per-CLASS identity:
+        ident = f"CIFAR_{label}"
+        p = os.path.join(root, f"img_{i}.png")
+        if not os.path.exists(p):
+            img.save(p)
+        samples.append({"path": p, "identity": ident, "spectrum": "CIFAR"})
+    n_id = len(set(s["identity"] for s in samples))
+    print(f"  [CIFAR] {len(samples)} images, {n_id} identities -> {root}")
+    return samples
