@@ -141,16 +141,14 @@ def eval_with_projector(g_raw, g_lab, p_raw, p_lab, Pmat=None):
     return evaluate_rank1_eer(g, g_lab, p, p_lab)
 
 
-def keep_top_k(U, k):
-    """Projector onto span of the k leading eigendirections."""
-    Uk = U[:, :k]
-    return Uk @ Uk.T
-
-
-def drop_top_n(U, n, d):
-    """Projector onto the complement of the n leading eigendirections."""
-    Un = U[:, :n]
-    return torch.eye(d) - Un @ Un.T
+def projector(U, order, n, mode, d):
+    """Projector for the n directions ranked highest by `order`.
+       order : 1-D index array into U's columns, highest priority first
+       mode  : 'keep'   -> project ONTO those n directions
+               'remove' -> project onto the COMPLEMENT (I - that)"""
+    V = U[:, order[:n]]
+    P = V @ V.T
+    return P if mode == "keep" else (torch.eye(d) - P)
 
 
 def residual_energy(X, U, k):
@@ -242,6 +240,10 @@ def main():
     evals, U = torch.linalg.eigh(C0)          # ASCENDING
     evals = evals.flip(0)                     # -> descending
     U = U.flip(1).float()                     # -> descending (columns)
+    d = U.shape[0]
+    order_energy = np.arange(d)                       # eigh already sorted desc
+    part_ratio = float((evals.sum()**2) / (evals**2).sum())   # effective rank
+    print(f"  participation ratio (effective rank) = {part_ratio:.1f} / {d}")
     evals = evals.clamp_min(0)
     energy = (evals / evals.sum()).numpy()
     cum_energy = np.cumsum(energy)
@@ -251,41 +253,6 @@ def main():
     ks = sorted(set([1, 2, 4, 8, 12, 16, 24, 32, 48, 64, 80, 96, 128,
                      160, 192, 224, d]))
     ks = [k for k in ks if 1 <= k <= d]
-
-    # ══════════════════════════════════════════════════════════
-    #  Q1 — retention: keep top-k
-    # ══════════════════════════════════════════════════════════
-    print(f"\n  ── Q1  keep top-k ──")
-    keep = {"k": [], "eer": [], "rank1": [], "discarded_energy": []}
-    for k in ks:
-        r = eval_with_projector(sg_raw, sg_lab, sp_raw, sp_lab,
-                                keep_top_k(U, k))
-        disc = float(energy[k:].sum())
-        keep["k"].append(k); keep["eer"].append(r["eer"])
-        keep["rank1"].append(r["rank1"]); keep["discarded_energy"].append(disc)
-        print(f"    k={k:3d}  EER={r['eer']:6.2f}  R1={r['rank1']:6.2f}  "
-              f"discarded_energy={disc:.5f}")
-
-    ok = [k for k, e in zip(keep["k"], keep["eer"])
-          if e <= base["eer"] + args.eps_eer]
-    k_star = min(ok) if ok else d
-    print(f"    k* = {k_star}  (smallest k with EER <= base + "
-          f"{args.eps_eer})  -> free capacity {d - k_star}/{d}")
-
-    # ══════════════════════════════════════════════════════════
-    #  Q2 — ablation: remove top-N
-    # ══════════════════════════════════════════════════════════
-    print(f"\n  ── Q2  remove top-N ──")
-    Ns = [n for n in [0, 1, 2, 4, 8, 16, 32, 64, 96, 128] if n < d]
-    drop = {"n": [], "eer": [], "rank1": [], "removed_energy": []}
-    for n in Ns:
-        Pm = None if n == 0 else drop_top_n(U, n, d)
-        r = eval_with_projector(sg_raw, sg_lab, sp_raw, sp_lab, Pm)
-        rem = float(energy[:n].sum())
-        drop["n"].append(n); drop["eer"].append(r["eer"])
-        drop["rank1"].append(r["rank1"]); drop["removed_energy"].append(rem)
-        print(f"    N={n:3d}  EER={r['eer']:6.2f}  R1={r['rank1']:6.2f}  "
-              f"removed_energy={rem:.5f}")
 
     # ══════════════════════════════════════════════════════════
     #  Q3 — attribution: identity vs spectrum, per direction
@@ -329,6 +296,45 @@ def main():
         sel = None
         print("    skipped (no target spectrum samples)")
 
+    ### 
+    order_fid  = np.argsort(-fid)      # most IDENTITY-discriminative first
+    order_fdom = np.argsort(-fdom)     # most SPECTRUM/nuisance first
+    order_rand = np.random.default_rng(args.seed).permutation(d)   # control
+    
+    RANKINGS = {
+        "energy":     order_energy,    # what the covariance ranks by
+        "fisher_id":  order_fid,       # what identity matching ranks by
+        "fisher_dom": order_fdom,      # what illumination/sensor ranks by
+        "random":     order_rand,      # control: does ranking matter at all?
+    }
+
+    # ══════════════════════════════════════════════════════════
+    #  Q1 and Q2
+    # ══════════════════════════════════════════════════════════
+    ns = [n for n in [1,2,4,8,12,16,24,32,48,64,96,128,192,256] if 1 <= n <= d]
+    sweeps, nstar = {}, {}
+    
+    for rank_name, order in RANKINGS.items():
+        for mode in ("keep", "remove"):
+            rows = []
+            for n in ns:
+                if   mode == "keep"   and n >= d: P = None      # keep-all = identity
+                elif mode == "remove" and n == 0: P = None
+                else:                             P = projector(U, order, n, mode, d)
+                r = eval_with_projector(sg_raw, sg_lab, sp_raw, sp_lab, P)
+                rows.append({"n": n, "eer": r["eer"], "rank1": r["rank1"]})
+            sweeps[f"{rank_name}_{mode}"] = rows
+    
+            # smallest n reaching baseline (keep) / first n that breaks it (remove)
+            if mode == "keep":
+                hit = [x["n"] for x in rows if x["eer"] <= base["eer"] + args.eps_eer]
+                nstar[f"{rank_name}_keep"] = min(hit) if hit else d
+            print(f"  [{rank_name:11s} {mode:6s}] " +
+                  "  ".join(f"{x['n']}:E{x['eer']:.1f}/R{x['rank1']:.0f}" for x in rows))
+    
+    print(f"\n  n* to retain baseline (keep):")
+    for r in RANKINGS:
+        print(f"    {r:11s} n*={nstar.get(r+'_keep')}")
     # ══════════════════════════════════════════════════════════
     #  Q4 — complementary: is the free space usable by the target?
     # ══════════════════════════════════════════════════════════
