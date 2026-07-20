@@ -164,6 +164,29 @@ def eval_through(U, k, g, gl, p, pl):
     p = F.normalize(p @ P, dim=-1)
     return evaluate_rank1_eer(g, gl, p, pl)
 
+def recon_error_curve(X, U, ns):
+    """Signal B: fraction of target energy LOST by keeping only top-k directions.
+       recon(k) = mean_i ||x_i - U_k U_k^T x_i||^2 / ||x_i||^2 .
+       Equivalently 1 - (energy inside top-k)/(total energy). Label-free."""
+    Xd = X.double()
+    total = Xd.pow(2).sum(1).clamp_min(1e-12)          # per-sample energy
+    curve = []
+    for k in ns:
+        Uk = U[:, :k].double()
+        inside = (Xd @ Uk).pow(2).sum(1)               # energy kept
+        recon = float((1.0 - inside / total).mean())   # energy lost
+        curve.append({"k": int(k), "recon_error": recon,
+                      "energy_kept": 1.0 - recon})
+    return curve
+
+
+def knee_from_curve(curve, tol=0.01):
+    """Smallest k whose recon_error <= tol (energy_kept >= 1 - tol)."""
+    for row in curve:
+        if row["recon_error"] <= tol:
+            return row["k"]
+    return curve[-1]["k"]
+
 
 # ══════════════════════════════════════════════════════════════
 #  Main
@@ -199,6 +222,17 @@ def main():
     tg, tgl = extract_raw(fe, make_loader(t_gal, id_map, arch["img_size"], args), dev)
     tp, tpl = extract_raw(fe, make_loader(t_prb, id_map, arch["img_size"], args), dev)
     ev_t, U_t, C_t = cov_eig(tg)
+
+    # ── Signal B: reconstruction-error knee (label-free k selection) ──
+    reconB = recon_error_curve(tg, U_t, ns)
+    print(f"\n  ── Signal B: target reconstruction error vs k (label-free) ──")
+    print(f"    {'k':>4} | {'recon_err':>10} {'energy_kept':>12}")
+    for row in reconB:
+        print(f"    {row['k']:>4} | {row['recon_error']:10.4f} "
+              f"{row['energy_kept']:12.4f}")
+    for tol in (0.05, 0.02, 0.01, 0.005):
+        print(f"    knee @ energy_kept>={1-tol:.3f}  ->  k*_B = "
+              f"{knee_from_curve(reconB, tol)}")
 
     part_s = float((ev_s.double().sum()**2) / (ev_s.double()**2).sum())
     part_t = float((ev_t.double().sum()**2) / (ev_t.double()**2).sum())
@@ -405,6 +439,9 @@ def main():
         "target_through_source": tgt_thru_src,
         "ratio_source_dirs": ratio.tolist(),
         "M_spectrum": sig_M.tolist(),
+        "reconstruction_B": reconB,
+        "kB_at_tol": {str(t): knee_from_curve(reconB, t)
+                      for t in (0.05, 0.02, 0.01, 0.005)},
     }
     jp = f"{args.out_dir}/reconstruct_{tag}.json"
     with open(jp, "w") as f:
