@@ -314,7 +314,7 @@ def main():
     os.makedirs(args.out_dir, exist_ok=True)
     print(f"\n{'=' * 78}\n  SOURCE SUBSPACE ANALYSIS\n{'=' * 78}\n")
 
-    fe, arch, ckpt = load_source_model(args)
+    enc, fe, arch, ckpt = load_source_model(args)
     d, dev = arch["embed_dim"], args.device
 
     all_samples = scan_dataset(args.data_dir)
