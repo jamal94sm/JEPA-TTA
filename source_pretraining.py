@@ -428,7 +428,7 @@ def main():
 
     if cfg.method == "jepa":
         train_jepa(cfg, train_loader, eval_dict, id_map, n_train_ids)
-    else:
+    elif cfg.method == "compnet":
         train_compnet(cfg, train_loader, eval_dict, id_map, n_train_ids, train_id_map)
     else:
         raise SystemExit(f"unknown method: {cfg.method}")
