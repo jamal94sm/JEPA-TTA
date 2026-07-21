@@ -241,7 +241,7 @@ def train_jepa(cfg, train_loader, eval_dict, id_map, n_classes):
 
 def train_compnet(cfg, train_loader, eval_dict, id_map, n_train_ids):
     print(f"\n  Building CompNet (supervised)...")
-    model = CompNet(cfg.embed_dim, n_train_ids, base=cfg.compnet_channels)
+    model = CompNet(cfg.embed_dim, n_train_ids, base=cfg.compnet_channels).to(cfg.device)
     n_par = sum(p.numel() for p in model.parameters())
     print(f"  CompNet: {n_par/1e6:.2f}M params   n_classes={n_train_ids}")
 
