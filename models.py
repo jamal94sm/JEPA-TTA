@@ -279,3 +279,53 @@ def update_ema(context_encoder, target_encoder, momentum):
     for pc, pt in zip(context_encoder.parameters(),
                       target_encoder.parameters()):
         pt.data.mul_(momentum).add_(pc.data * (1.0 - momentum))
+
+
+
+# ══════════════════════════════════════════════════════════════
+#  CompNet — competitive CNN backbone + supervised head
+# ══════════════════════════════════════════════════════════════
+
+class GaborConv2d(nn.Module):
+    """Learnable Gabor-style competitive filters (CompNet's core block)."""
+    def __init__(self, in_ch, out_ch, kernel=7):
+        super().__init__()
+        self.conv = nn.Conv2d(in_ch, out_ch, kernel, padding=kernel // 2, bias=False)
+        self.bn = nn.BatchNorm2d(out_ch)
+
+    def forward(self, x):
+        return F.relu(self.bn(self.conv(x)))
+
+
+class CompNetBackbone(nn.Module):
+    """CNN backbone. forward(x) -> [B, embed_dim] feature (pre-classifier).
+       Mirrors FeatureExtractor's output contract so all downstream code
+       (evaluate, subspace analysis) works unchanged."""
+    def __init__(self, embed_dim=256, base=16, in_ch=3):
+        super().__init__()
+        self.stem = GaborConv2d(in_ch, base, 7)
+        self.block1 = GaborConv2d(base, base * 2, 5)
+        self.block2 = GaborConv2d(base * 2, base * 4, 3)
+        self.block3 = GaborConv2d(base * 4, base * 8, 3)
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.proj = nn.Linear(base * 8, embed_dim)
+
+    def forward(self, x):
+        x = F.max_pool2d(self.stem(x), 2)
+        x = F.max_pool2d(self.block1(x), 2)
+        x = F.max_pool2d(self.block2(x), 2)
+        x = self.block3(x)
+        x = self.pool(x).flatten(1)          # [B, base*8]
+        return self.proj(x)                   # [B, embed_dim]
+
+
+class CompNet(nn.Module):
+    """Backbone + linear classifier for supervised CE pretraining."""
+    def __init__(self, embed_dim, n_classes, base=16, in_ch=3):
+        super().__init__()
+        self.backbone = CompNetBackbone(embed_dim, base, in_ch)
+        self.classifier = nn.Linear(embed_dim, n_classes)
+
+    def forward(self, x):
+        feat = self.backbone(x)               # [B, embed_dim]
+        return self.classifier(feat), feat
