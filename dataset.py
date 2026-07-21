@@ -219,8 +219,7 @@ def split_gallery_probe(samples, id_map, gallery_ratio=0.5, seed=2025):
 
 def build_datasets(cfg):
     """
-    Build train + eval datasets for the configured mode.
-    Returns: train_loader, eval_dict, id_map, info_str
+    Returns: train_loader, eval_dict, id_map (global), n_train_ids
     """
     all_samples = scan_dataset(cfg.data_dir)
     print(f"  Total samples: {len(all_samples)}")
@@ -242,24 +241,34 @@ def build_datasets(cfg):
         info = (f"Train domains: {cfg.train_spectrums}, "
                 f"Train ID ratio: {cfg.train_id_ratio}")
 
-    # Build global ID map from ALL samples (so labels are consistent)
+    # Global ID map from ALL samples: keeps gallery/probe labels consistent
+    # across seen AND unseen identities (needed for evaluation).
     id_map = build_id_map(all_samples)
     n_classes = len(id_map)
+
+    # Training-only ID map: CONTIGUOUS 0..K-1 over identities that actually
+    # appear in the training split. This is what the CompNet CE head is sized
+    # from — a classifier over unseen (open-set) IDs would be wrong.
+    train_id_map = build_id_map(train_samples)
+    n_train_ids = len(train_id_map)
 
     print(f"\n  Mode: {cfg.mode} ({info})")
     print(f"  Train samples: {len(train_samples)} "
           f"(×{cfg.aug_multiplier} aug = "
           f"{len(train_samples) * cfg.aug_multiplier})")
+    print(f"  Global IDs: {n_classes}   Training IDs (CE classes): {n_train_ids}")
     for name, samples in eval_sets.items():
         n_ids = len(set(s["identity"] for s in samples))
         print(f"  Eval '{name}': {len(samples)} samples, {n_ids} IDs")
 
-    train_ds = CASIADataset(train_samples, id_map, cfg.img_size,
-                             augment=True, aug_multiplier=cfg.aug_multiplier)
+    # Training set uses the TRAINING id map (so CE labels are 0..n_train_ids-1).
+    train_ds = CASIADataset(train_samples, train_id_map, cfg.img_size,
+                            augment=True, aug_multiplier=cfg.aug_multiplier)
     train_loader = DataLoader(train_ds, batch_size=cfg.batch_size,
-                               shuffle=True, num_workers=cfg.num_workers,
-                               drop_last=True, pin_memory=True)
+                              shuffle=True, num_workers=cfg.num_workers,
+                              drop_last=True, pin_memory=True)
 
+    # Eval sets use the GLOBAL id map (seen + unseen must share label space).
     eval_dict = {}
     for name, samples in eval_sets.items():
         gal_samples, prb_samples = split_gallery_probe(
@@ -279,7 +288,7 @@ def build_datasets(cfg):
             "n_probe": len(prb_samples),
         }
 
-    return train_loader, eval_dict, id_map, n_classes
+    return train_loader, eval_dict, id_map, n_train_ids
 
 # ========================================================
 #XJTU-UP dataset
