@@ -288,7 +288,8 @@ def build_datasets(cfg):
             "n_probe": len(prb_samples),
         }
 
-    return train_loader, eval_dict, id_map, n_train_ids
+    # in build_datasets, the return line:
+    return train_loader, eval_dict, id_map, n_train_ids, train_id_map
 
 # ========================================================
 #XJTU-UP dataset
