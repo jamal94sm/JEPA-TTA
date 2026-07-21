@@ -89,18 +89,35 @@ def load_source_model(args):
     if arch is None:
         if None in (args.img_size, args.num_patches, args.embed_dim):
             raise SystemExit("ckpt has no 'arch'; pass --img_size --num_patches "
-                             "--embed_dim, or re-save with the main.py patch.")
+                             "--embed_dim, or re-save with the pretraining patch.")
         arch = {"img_size": args.img_size, "num_patches": args.num_patches,
                 "embed_dim": args.embed_dim}
-    enc = ContextEncoder((arch["img_size"], arch["img_size"]),
-                         arch["num_patches"], arch["embed_dim"])
-    enc.load_state_dict(ckpt["context_encoder"])
-    enc.to(args.device).eval()
-    for q in enc.parameters():
-        q.requires_grad = False
-    print(f"  ckpt {os.path.basename(args.ckpt)}  "
-          f"epoch={ckpt.get('epoch', '?')}  d={arch['embed_dim']}")
-    return FeatureExtractor(enc), arch, ckpt
+
+    method = ckpt.get("method", "jepa")          # default keeps old ckpts working
+
+    if method == "compnet":
+        from models import CompNetBackbone
+        enc = CompNetBackbone(arch["embed_dim"],
+                              base=arch.get("compnet_channels", 16))
+        enc.load_state_dict(ckpt["backbone"])
+        enc.to(args.device).eval()
+        for q in enc.parameters():
+            q.requires_grad = False
+        print(f"  ckpt {os.path.basename(args.ckpt)}  method=compnet  "
+              f"d={arch['embed_dim']}")
+        fe = enc                                 # backbone IS the feature extractor
+    else:                                        # jepa (unchanged path)
+        enc = ContextEncoder((arch["img_size"], arch["img_size"]),
+                             arch["num_patches"], arch["embed_dim"])
+        enc.load_state_dict(ckpt["context_encoder"])
+        enc.to(args.device).eval()
+        for q in enc.parameters():
+            q.requires_grad = False
+        print(f"  ckpt {os.path.basename(args.ckpt)}  method=jepa  "
+              f"d={arch['embed_dim']}")
+        fe = FeatureExtractor(enc)
+
+    return enc, fe, arch, ckpt
 
 
 def make_loader(samples, id_map, img_size, args):
