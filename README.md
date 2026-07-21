@@ -14,12 +14,14 @@ nohup python source_pretraining.py --method compnet --data_dir /home/pai-ng/Jama
 
 
 # subspace analysis
-subspace_analysis.py :
+
+### JEPA
 python subspace_analysis.py \
   --data_dir /home/pai-ng/Jamal/CASIA-MS-ROI \
   --ckpt ./output_jepa/ckpt_source_CASIA-MS-ROI_cross_domain_WHT-940_8x.pth \
   --source_spectrum WHT --target_spectrum 940
 
+### CompNet
 python subspace_analysis.py \
   --data_dir /home/pai-ng/Jamal/CASIA-MS-ROI \
   --ckpt ./output_compnet/ckpt_casiams_compnet_WHT.pth \
@@ -35,6 +37,10 @@ S0​ and its complement → tests whether the freed directions are usable for a
 
 # source subspace approximation
 
+### JEPA
 python subspace_reconstruct.py   --data_dir /home/pai-ng/Jamal/CASIA-MS-ROI   --ckpt ./output_jepa/ckpt_source_CASIA-MS-ROI_cross_domain_openset_WHT_8x.pth   --source_spectrum WHT --target_dataset cifar   --out_dir ./output_reconstruct/CIFAR
+
+### CompNet
+python subspace_reconstruct.py --data_dir /home/pai-ng/Jamal/CASIA-MS-ROI --ckpt ./output_compnet/ckpt_casiams_compnet_WHT.pth --source_spectrum WHT --target_dataset cifar --out_dir ./output_reconstruct/CIFAR
 
 
