@@ -239,10 +239,9 @@ def train_jepa(cfg, train_loader, eval_dict, id_map, n_classes):
 #  CompNet (supervised cross-entropy on training IDs)
 # ══════════════════════════════════════════════════════════════
 
-def train_compnet(cfg, train_loader, eval_dict, id_map, n_classes):
+def train_compnet(cfg, train_loader, eval_dict, id_map, n_train_ids):
     print(f"\n  Building CompNet (supervised)...")
-    model = CompNet(cfg.embed_dim, n_classes,
-                    base=cfg.compnet_channels).to(cfg.device)
+    model = CompNet(cfg.embed_dim, n_train_ids, base=cfg.compnet_channels)
     n_par = sum(p.numel() for p in model.parameters())
     print(f"  CompNet: {n_par/1e6:.2f}M params   n_classes={n_classes}")
 
@@ -423,12 +422,12 @@ def main():
           f"epochs={cfg.epochs}   aug={cfg.aug_multiplier}×")
     print(f"{'='*80}\n")
 
-    train_loader, eval_dict, id_map, n_classes = build_datasets(cfg)
+    train_loader, eval_dict, id_map, n_train_ids = build_datasets(cfg)
 
     if cfg.method == "jepa":
         train_jepa(cfg, train_loader, eval_dict, id_map, n_classes)
     elif cfg.method == "compnet":
-        train_compnet(cfg, train_loader, eval_dict, id_map, n_classes)
+        train_compnet(cfg, train_loader, eval_dict, id_map, n_train_ids)
     else:
         raise SystemExit(f"unknown method: {cfg.method}")
 
