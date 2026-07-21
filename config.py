@@ -33,6 +33,16 @@ def get_cfg(args=None):
     p.add_argument("--aug_multiplier", type=int, default=8,
                    help="Augmentation multiplier for training data")
 
+    # ─── Method toggle ────────────────────────────────────────
+    p.add_argument("--method", default="jepa",
+                   choices=["jepa", "compnet"],
+                   help="jepa = transformer + self-supervised; "
+                        "compnet = CNN + supervised CE on IDs")
+    # ─── CompNet (supervised) ─────────────────────────────────
+    p.add_argument("--compnet_channels", type=int, default=16,
+                   help="base channel width of the Gabor/competition block")
+    p.add_argument("--label_smoothing", type=float, default=0.0)
+    
     # ─── JEPA architecture ────────────────────────────────────
     p.add_argument("--embed_dim", type=int, default=256)
     p.add_argument("--num_patches", type=int, default=8,
