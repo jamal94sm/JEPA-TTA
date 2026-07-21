@@ -425,7 +425,7 @@ def main():
     train_loader, eval_dict, id_map, n_train_ids = build_datasets(cfg)
 
     if cfg.method == "jepa":
-        train_jepa(cfg, train_loader, eval_dict, id_map, n_classes)
+        train_jepa(cfg, train_loader, eval_dict, id_map, n_train_ids)
     elif cfg.method == "compnet":
         train_compnet(cfg, train_loader, eval_dict, id_map, n_train_ids)
     else:
