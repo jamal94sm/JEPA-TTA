@@ -239,7 +239,7 @@ def train_jepa(cfg, train_loader, eval_dict, id_map, n_classes):
 #  CompNet (supervised cross-entropy on training IDs)
 # ══════════════════════════════════════════════════════════════
 
-def train_compnet(cfg, train_loader, eval_dict, id_map, n_train_ids):
+def train_compnet(cfg, train_loader, eval_dict, id_map, n_train_ids, train_id_map):
     print(f"\n  Building CompNet (supervised)...")
     model = CompNet(cfg.embed_dim, n_train_ids, base=cfg.compnet_channels).to(cfg.device)
     n_par = sum(p.numel() for p in model.parameters())
@@ -322,6 +322,8 @@ def train_compnet(cfg, train_loader, eval_dict, id_map, n_train_ids):
                     "arch": {"embed_dim": cfg.embed_dim,
                              "compnet_channels": cfg.compnet_channels,
                              "img_size": cfg.img_size},
+                    "train_id_map": train_id_map,        # ← identity str -> class idx
+                    "n_train_ids": n_train_ids,          # ← convenient, redundant but explicit
                     "mean_rank1": mean_r1, "mean_eer": mean_eer,
                 }, ckpt_path)
                 print(f"    ★ New best EER={mean_eer:.2f}% "
@@ -422,12 +424,12 @@ def main():
           f"epochs={cfg.epochs}   aug={cfg.aug_multiplier}×")
     print(f"{'='*80}\n")
 
-    train_loader, eval_dict, id_map, n_train_ids = build_datasets(cfg)
+    train_loader, eval_dict, id_map, n_train_ids, train_id_map = build_datasets(cfg)
 
     if cfg.method == "jepa":
         train_jepa(cfg, train_loader, eval_dict, id_map, n_train_ids)
-    elif cfg.method == "compnet":
-        train_compnet(cfg, train_loader, eval_dict, id_map, n_train_ids)
+    else:
+        train_compnet(cfg, train_loader, eval_dict, id_map, n_train_ids, train_id_map)
     else:
         raise SystemExit(f"unknown method: {cfg.method}")
 
