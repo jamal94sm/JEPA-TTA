@@ -9,6 +9,11 @@ Both paths share the same dataset pipeline and the same evaluation
 produces [B, embed_dim] features — so all downstream subspace tooling works
 unchanged. Point --output_dir somewhere method-specific so checkpoints do not
 collide (e.g. ./output_jepa vs ./output_compnet).
+
+
+python source_pretraining.py --method compnet --data_dir /home/pai-ng/Jamal/CASIA-MS-ROI --mode cross_domain_openset --train_spectrums WHT --output_dir ./output_compnet
+
+
 """
 
 import os
