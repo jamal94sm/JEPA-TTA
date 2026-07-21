@@ -20,6 +20,11 @@ python subspace_analysis.py \
   --ckpt ./output_jepa/ckpt_source_CASIA-MS-ROI_cross_domain_WHT-940_8x.pth \
   --source_spectrum WHT --target_spectrum 940
 
+python subspace_analysis.py \
+  --data_dir /home/pai-ng/Jamal/CASIA-MS-ROI \
+  --ckpt ./output_compnet/ckpt_casiams_compnet_WHT.pth \
+  --source_spectrum WHT --target_spectrum 940
+
 Characterizes the source model's feature subspace from a trained JEPA checkpoint, offline and without further training. Given a checkpoint and the dataset directory, it rebuilds the frozen encoder, builds the source feature covariance C0=UΛU⊤C_0 = U\Lambda U^\top
 C0​=UΛU⊤ from the gallery split, and runs four analyses: retention (keep top-kk
 k directions → find k⋆k^\star
