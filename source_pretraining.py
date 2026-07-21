@@ -35,6 +35,14 @@ def set_seed(seed):
     torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
 
+def ckpt_name(cfg):
+    """ckpt_{dataset}_{method}_{source_domain}.pth"""
+    dataset = os.path.basename(os.path.normpath(cfg.data_dir)).lower()
+    dataset = "casiams" if "casia" in dataset else ("xjtu" if "xjtu" in dataset
+                                                    else dataset)
+    domain = "-".join(cfg.train_spectrums) if cfg.train_spectrums else "all"
+    return f"ckpt_{dataset}_{cfg.method}_{domain}.pth"
+
 
 # ══════════════════════════════════════════════════════════════
 #  Shared warmup-cosine LR schedule
@@ -184,7 +192,7 @@ def train_jepa(cfg, train_loader, eval_dict, id_map, n_classes):
             if mean_r1 > best_eval["mean_rank1"]:
                 best_eval = {"epoch": epoch, "mean_rank1": mean_r1,
                              "mean_eer": mean_eer}
-                ckpt_path = os.path.join(cfg.output_dir, "best.pth")
+                ckpt_path = os.path.join(cfg.output_dir, ckpt_name(cfg))
                 torch.save({
                     "epoch": epoch,
                     "method": "jepa",
@@ -301,7 +309,7 @@ def train_compnet(cfg, train_loader, eval_dict, id_map, n_classes):
             if mean_eer < best_eval["mean_eer"]:        # save on MIN EER
                 best_eval = {"epoch": epoch, "mean_rank1": mean_r1,
                              "mean_eer": mean_eer}
-                ckpt_path = os.path.join(cfg.output_dir, "best_compnet.pth")
+                ckpt_path = os.path.join(cfg.output_dir, ckpt_name(cfg))
                 torch.save({
                     "epoch": epoch,
                     "method": "compnet",
