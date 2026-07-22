@@ -83,7 +83,7 @@ def get_args():
     # subspace / projector
     p.add_argument("--k0", type=int, default=8,
                    help="floor on subspace size (validate per model/layer!)")
-    p.add_argument("--energy", type=float, default=0.99,
+    p.add_argument("--energy", type=float, default=0.98,
                    help="k_t = #dirs holding this fraction of target energy")
     p.add_argument("--proj_normalize", default="frobenius",
                    choices=["frobenius", "none"],
