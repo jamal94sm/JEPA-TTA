@@ -258,7 +258,22 @@ def residual_ratio(H, P):
     den = Hd.pow(2).sum(1).clamp_min(1e-12)
     return float((num / den).mean())
 
+def make_proj_pre_hook(M):
+    """forward_pre_hook that replaces proj's INPUT h with h @ M (M symmetric)."""
+    def hook(module, inputs):
+        h = inputs[0]
+        return (h @ M.to(h.device, h.dtype),)
+    return hook
 
+
+def evaluate_through_subspace(model, M, gal_loader, prb_loader, device):
+    """Evaluate with proj's input passed through the projector M."""
+    h = model.backbone.proj.register_forward_pre_hook(make_proj_pre_hook(M))
+    try:
+        return evaluate_domain(model, gal_loader, prb_loader, device)
+    finally:
+        h.remove()
+      
 # ══════════════════════════════════════════════════════════════════════
 #  BN pack  (per-domain state: gamma, beta, running mean/var)
 # ══════════════════════════════════════════════════════════════════════
@@ -519,6 +534,42 @@ def main():
     src_bn_pack = snapshot_bn(model)
     print(f"  snapshotted source BN pack: {len(src_bn_pack)} layers")
 
+    # ── P2b  Does the TARGET-derived subspace preserve the SOURCE? ──
+    print(f"\n{'─'*78}\n  P2b  Functional check: SOURCE through TARGET-derived "
+          f"subspace\n{'─'*78}")
+    d = info["d"]; k = info["k"]
+    # rebuild the un-normalised bases (P was Frobenius-scaled)
+    C = (H_t.double().T @ H_t.double()) / H_t.size(0)
+    ev_t, U_t = torch.linalg.eigh(C)
+    U_t = U_t.flip(1).float()
+
+    print(f"  {'k':>5} | {'src EER':>8} {'dEER':>7} | {'src R1':>8} {'dR1':>7} "
+          f"| {'tgt EER':>8} {'tgt R1':>8}")
+    curve = []
+    for kk in [k_ for k_ in (4, 8, 16, 24, 32, 48, 64, 96, d) if k_ <= d]:
+        Uk = U_t[:, :kk]
+        M_keep = Uk @ Uk.T                       # project ONTO the kept subspace
+        rs = evaluate_through_subspace(model, M_keep, s_gal_l, s_prb_l, dev)
+        rt = evaluate_through_subspace(model, M_keep, t_gal_l, t_prb_l, dev)
+        de = rs["eer"] - base_s["eer"]
+        dr = rs["rank1"] - base_s["rank1"]
+        curve.append({"k": kk, "src_eer": rs["eer"], "src_rank1": rs["rank1"],
+                      "d_eer": de, "d_rank1": dr,
+                      "tgt_eer": rt["eer"], "tgt_rank1": rt["rank1"]})
+        mark = "  <-- k used" if kk == k else ""
+        print(f"  {kk:5d} | {rs['eer']:8.2f} {de:+7.2f} | "
+              f"{rs['rank1']:8.2f} {dr:+7.2f} | "
+              f"{rt['eer']:8.2f} {rt['rank1']:8.2f}{mark}")
+
+    k_ok = next((c["k"] for c in curve
+                 if c["d_eer"] <= args.eps_src and c["d_rank1"] >= -args.eps_src),
+                d)
+    print(f"  smallest k preserving source (±{args.eps_src}) = {k_ok}")
+    print(f"  if source survives at k={k}, the target-built P0 spans what the "
+          f"source needs => protection is justified")
+    R["source_through_target_subspace"] = {"curve": curve, "k_ok": k_ok}
+
+  
     # ── P3 / P4 ───────────────────────────────────────────────────────
     results = {}
     for arm, method in [("TENT", "tent"), ("NS-CTTA", "nsctta")]:
