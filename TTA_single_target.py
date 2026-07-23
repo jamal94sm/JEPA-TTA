@@ -108,6 +108,10 @@ def get_args():
     p.add_argument("--device", default="cuda")
     p.add_argument("--seed", type=int, default=2025)
     p.add_argument("--out_dir", default="./output_tta")
+    p.add_argument("--eps_src", type=float, default=0.5,
+                   help="tolerance (EER pts / R1 pts) for 'source preserved' "
+                        "in the P2b functional check")
+  
     return p.parse_args()
 
 
@@ -561,9 +565,9 @@ def main():
               f"{rs['rank1']:8.2f} {dr:+7.2f} | "
               f"{rt['eer']:8.2f} {rt['rank1']:8.2f}{mark}")
 
+    eps_src = 0.5
     k_ok = next((c["k"] for c in curve
-                 if c["d_eer"] <= args.eps_src and c["d_rank1"] >= -args.eps_src),
-                d)
+                 if c["d_eer"] <= eps_src and c["d_rank1"] >= -eps_src), d)
     print(f"  smallest k preserving source (±{args.eps_src}) = {k_ok}")
     print(f"  if source survives at k={k}, the target-built P0 spans what the "
           f"source needs => protection is justified")
