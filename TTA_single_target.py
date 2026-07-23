@@ -95,7 +95,7 @@ def get_args():
     p.add_argument("--k0_frac", type=float, default=0.0,
                    help="floor as a FRACTION of each layer's dim (0 = off). "
                         "Use this instead of --k0 when layers differ in size.")
-    p.add_argument("--energy", type=float, default=0.99,
+    p.add_argument("--energy", type=float, default=0.95,
                    help="k_t = #dirs holding this fraction of target energy")
     p.add_argument("--proj_normalize", default="frobenius",
                    choices=["frobenius", "none"])
