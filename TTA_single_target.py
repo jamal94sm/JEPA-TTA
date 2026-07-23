@@ -81,9 +81,9 @@ def get_args():
                         "is the held-out gallery/probe test split")
     p.add_argument("--gallery_ratio", type=float, default=0.5)
     # subspace / projector
-    p.add_argument("--k0", type=int, default=4,
+    p.add_argument("--k0", type=int, default=16,
                    help="floor on subspace size (validate per model/layer!)")
-    p.add_argument("--energy", type=float, default=0.95,
+    p.add_argument("--energy", type=float, default=0.98,
                    help="k_t = #dirs holding this fraction of target energy")
     p.add_argument("--proj_normalize", default="frobenius",
                    choices=["frobenius", "none"],
