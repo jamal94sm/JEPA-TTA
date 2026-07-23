@@ -1,48 +1,52 @@
 """
-TTA_single_target.py — Test-time adaptation on ONE target domain.
+TTA_single_target.py — Test-time adaptation on ONE target domain (v2).
 
 Simulates the single-domain leg of NS-CTTA, assuming a new-domain detector has
-already fired. Source data is NEVER used to build the projector or to adapt; it
-is used only as an ORACLE DIAGNOSTIC to measure forgetting.
+already fired. Source data is NEVER used to build projectors or to adapt; it is
+used only as an ORACLE DIAGNOSTIC to measure forgetting.
 
 ═══════════════════════════════════════════════════════════════════════════
-  PHASES
+  ARMS
 ═══════════════════════════════════════════════════════════════════════════
-  P0  Load frozen source model (CompNet) + train_id_map; build closed-set
-      adapt/test splits for BOTH source and target domains.
-  P1  Baselines: source model evaluated on target test and source test.
-  P2  Build the null-space projector from TARGET pooled activations
-      (proxy for the source subspace — no source data used).
-        k = max(k0, k_t@energy)   P = I - U_k U_k^T   (Frobenius-normalised)
-  P3  Arm A — TENT baseline: BN affine only, NO projection.
-  P4  Arm B — NS-CTTA: proj.weight (projected) + BN, classifier frozen.
-  P5  Source re-evaluation with the stored source BN pack restored.
-  P6  Results table + JSON dump.
+  tent        BN affine only, batch stats, NO projection      (TENT baseline)
+  nsctta      projected layers only, BN FULLY FROZEN          (isolates the
+                                                               projection)
+  nsctta_bn   projected layers + BN adapt + per-domain BN pack restore
 
 ═══════════════════════════════════════════════════════════════════════════
-  KEY DESIGN POINTS
+  MULTI-LAYER NS-CTTA  (--layers)
 ═══════════════════════════════════════════════════════════════════════════
-  * Protected layer = backbone.proj  (Linear 128 -> 256).
-    A layer is protected in the space of ITS INPUT, so the projector is 128-d
-    (proj's input = pooled vector), NOT 256-d. Guarantee:
-        dW_proj @ h_src = 0  =>  feature x unchanged  =>  logits unchanged
-    (classifier frozen), i.e. representation-level preservation.
-  * proj.BIAS IS FROZEN. y = Wx + b gives dy = dW x + db; an additive db cannot
-    be projected away, so training it would void the guarantee.
-  * Classifier FROZEN: closed-set readout is already correct, and a trainable
-    head under entropy loss collapses to one confident class.
-  * Projection is applied to the ADAM UPDATE (not the raw gradient), following
-    Adam-NSCL, and P is normalised by its Frobenius norm -> updates shrink by
-    ~1/sqrt(rank), so the projected group needs a LARGER lr (see --proj_lr).
-  * BN packs (gamma, beta, running mean/var) are snapshotted per domain BEFORE
-    any target batch touches them, and restored on source recurrence.
+  Every selected layer gets its OWN projector, built from the covariance of
+  THAT layer's INPUT — following Adam-NSCL:
+      Linear : C = a^T a                 a  = layer input          [in, in]
+      Conv2d : C = u^T u                 u  = im2col patches  [C_in*k*k, ...]
+  and the Adam UPDATE is right-multiplied:   update <- update @ P .
+
+  CompNet layer menu (im2col / input dims):
+      backbone.stem.conv     3*7*7 = 147
+      backbone.block1.conv  16*5*5 = 400
+      backbone.block2.conv  32*3*3 = 288
+      backbone.block3.conv  64*3*3 = 576
+      backbone.proj                 = 128
+  Examples:
+      --layers proj                    (default; single-layer, as in v1)
+      --layers all                     (4 convs + proj)
+      --layers block3,proj
+      --layers conv                    (the 4 convs only)
+
+  classifier is ALWAYS frozen (closed-set readout is already correct, and a
+  trainable head under entropy loss collapses to one confident class).
+  proj.bias is ALWAYS frozen: y = Wx + b gives dy = dW x + db, and an additive
+  db cannot be projected away, which would void the guarantee. The conv layers
+  have bias=False already.
 
 USAGE
 -----
 python TTA_single_target.py \
     --ckpt ./output_compnet/ckpt_casiams_compnet_WHT.pth \
     --data_dir /home/pai-ng/Jamal/CASIA-MS-ROI \
-    --source_spectrum WHT --target_spectrum 700
+    --source_spectrum WHT --target_spectrum 700 \
+    --layers all
 """
 
 import os
@@ -65,6 +69,9 @@ from dataset import (scan_dataset, build_id_map, split_gallery_probe,
 from evaluate import evaluate_rank1_eer
 
 
+ALL_ARMS = ["tent", "nsctta", "nsctta_bn"]
+
+
 # ══════════════════════════════════════════════════════════════════════
 #  Args
 # ══════════════════════════════════════════════════════════════════════
@@ -76,42 +83,41 @@ def get_args():
     p.add_argument("--data_dir", required=True)
     p.add_argument("--source_spectrum", default="WHT")
     p.add_argument("--target_spectrum", default="700")
-    p.add_argument("--adapt_ratio", type=float, default=0.5,
-                   help="fraction of each domain used for ADAPTATION; the rest "
-                        "is the held-out gallery/probe test split")
+    p.add_argument("--adapt_ratio", type=float, default=0.5)
     p.add_argument("--gallery_ratio", type=float, default=0.5)
+    # which layers get a projector / are trainable
+    p.add_argument("--layers", default="proj",
+                   help="'proj' | 'conv' | 'all' | comma-separated names or "
+                        "substrings, e.g. 'block3,proj'")
     # subspace / projector
-    p.add_argument("--k0", type=int, default=16,
-                   help="floor on subspace size (validate per model/layer!)")
-    p.add_argument("--energy", type=float, default=0.98,
+    p.add_argument("--k0", type=int, default=0,
+                   help="absolute floor on protected dims per layer (0 = off)")
+    p.add_argument("--k0_frac", type=float, default=0.0,
+                   help="floor as a FRACTION of each layer's dim (0 = off). "
+                        "Use this instead of --k0 when layers differ in size.")
+    p.add_argument("--energy", type=float, default=0.99,
                    help="k_t = #dirs holding this fraction of target energy")
     p.add_argument("--proj_normalize", default="frobenius",
-                   choices=["frobenius", "none"],
-                   help="Adam-NSCL normalises P by ||P||_F")
+                   choices=["frobenius", "none"])
+    p.add_argument("--cov_batches", type=int, default=0,
+                   help="cap batches used for covariance (0 = all)")
     # TTA
-    p.add_argument("--adapt_mode", default="batch", choices=["batch", "set"],
-                   help="batch = online single pass; set = n_epochs over the set")
-    p.add_argument("--n_epochs", type=int, default=5,
-                   help="only used when --adapt_mode set")
+    p.add_argument("--arms", nargs="+", default=ALL_ARMS, choices=ALL_ARMS)
+    p.add_argument("--adapt_mode", default="batch", choices=["batch", "set"])
+    p.add_argument("--n_epochs", type=int, default=5)
     p.add_argument("--conf_ratio", type=float, default=0.4,
-                   help="TENT confidence filter: keep samples with "
-                        "H < conf_ratio * ln(C). 1.0 disables filtering")
-    p.add_argument("--bn_mode", default="adapt", choices=["adapt", "freeze"],
-                   help="adapt = BN affine trainable + batch stats (TENT-style); "
-                        "freeze = BN fully frozen (isolates the projected layer)")
+                   help="keep samples with H < conf_ratio*ln(C); 1.0 = off")
     p.add_argument("--lr", type=float, default=1e-3, help="lr for BN params")
     p.add_argument("--proj_lr", type=float, default=1e-2,
-                   help="lr for the PROJECTED proj.weight (needs to be larger "
-                        "because Frobenius normalisation shrinks updates)")
+                   help="lr for PROJECTED weights (Frobenius normalisation "
+                        "shrinks updates by ~1/sqrt(rank), so raise this)")
     p.add_argument("--batch_size", type=int, default=64)
     p.add_argument("--num_workers", type=int, default=4)
     p.add_argument("--device", default="cuda")
     p.add_argument("--seed", type=int, default=2025)
-    p.add_argument("--out_dir", default="./output_tta")
     p.add_argument("--eps_src", type=float, default=0.5,
-                   help="tolerance (EER pts / R1 pts) for 'source preserved' "
-                        "in the P2b functional check")
-  
+                   help="tolerance for 'source preserved' in the P2b check")
+    p.add_argument("--out_dir", default="./output_tta")
     return p.parse_args()
 
 
@@ -125,38 +131,29 @@ def set_seed(s):
 # ══════════════════════════════════════════════════════════════════════
 
 def load_source_model(args, all_samples):
-    """Rebuild the frozen CompNet source model and recover train_id_map."""
     ckpt = torch.load(args.ckpt, map_location="cpu", weights_only=False)
-    method = ckpt.get("method", "?")
-    if method != "compnet":
-        raise SystemExit(f"this script expects a CompNet checkpoint, got "
-                         f"method={method}")
+    if ckpt.get("method", "?") != "compnet":
+        raise SystemExit(f"expected a CompNet checkpoint, got "
+                         f"method={ckpt.get('method')}")
     arch = ckpt["arch"]
     n_cls = ckpt["classifier"]["weight"].shape[0]
-
     model = CompNet(arch["embed_dim"], n_cls,
                     base=arch.get("compnet_channels", 16)).to(args.device)
     model.backbone.load_state_dict(ckpt["backbone"])
     model.classifier.load_state_dict(ckpt["classifier"])
     model.eval()
 
-    # ── train_id_map: identity string -> classifier output index ──
     if "train_id_map" in ckpt:
-        train_id_map = ckpt["train_id_map"]
-        src = "checkpoint"
+        train_id_map, src = ckpt["train_id_map"], "checkpoint"
     else:
-        # Fallback: for mode='all' every identity was a training identity, so
-        # build_id_map over all samples reproduces it exactly. Validated below.
-        train_id_map = build_id_map(all_samples)
-        src = "REBUILT from data (ckpt lacks 'train_id_map')"
+        train_id_map, src = build_id_map(all_samples), "REBUILT from data"
     if len(train_id_map) != n_cls:
         raise SystemExit(
             f"train_id_map has {len(train_id_map)} ids but the classifier has "
-            f"{n_cls} outputs. Re-save the checkpoint with "
-            f"\"train_id_map\": train_id_map in train_compnet().")
+            f"{n_cls} outputs. Re-save with \"train_id_map\": train_id_map.")
 
-    print(f"  model : CompNet  d={arch['embed_dim']}  base="
-          f"{arch.get('compnet_channels', 16)}  classes={n_cls}")
+    print(f"  model : CompNet  d={arch['embed_dim']}  "
+          f"base={arch.get('compnet_channels',16)}  classes={n_cls}")
     print(f"  ckpt  : epoch={ckpt.get('epoch','?')}  "
           f"EER={ckpt.get('mean_eer', float('nan')):.2f}%  "
           f"R1={ckpt.get('mean_rank1', float('nan')):.2f}%")
@@ -165,9 +162,7 @@ def load_source_model(args, all_samples):
 
 
 def split_adapt_test(samples, adapt_ratio, seed):
-    """Per-identity split into an ADAPT stream and a held-out TEST set.
-       Every identity appears in both (closed-set), with >=2 test samples so
-       gallery/probe is well defined."""
+    """Per-identity split into an ADAPT stream and a held-out TEST set."""
     by_id = defaultdict(list)
     for s in samples:
         by_id[s["identity"]].append(s)
@@ -177,9 +172,8 @@ def split_adapt_test(samples, adapt_ratio, seed):
         items = by_id[ident][:]
         rng.shuffle(items)
         n_ad = int(round(len(items) * adapt_ratio))
-        n_ad = max(0, min(n_ad, len(items) - 2))   # leave >=2 for gallery+probe
-        adapt.extend(items[:n_ad])
-        test.extend(items[n_ad:])
+        n_ad = max(0, min(n_ad, len(items) - 2))   # keep >=2 for gallery+probe
+        adapt.extend(items[:n_ad]); test.extend(items[n_ad:])
     return adapt, test
 
 
@@ -190,32 +184,143 @@ def make_loader(samples, id_map, img_size, args, shuffle=False):
 
 
 # ══════════════════════════════════════════════════════════════════════
-#  Feature / activation extraction
+#  Layer selection
+# ══════════════════════════════════════════════════════════════════════
+
+def select_layers(model, spec):
+    """Return [(name, module)] of Conv2d/Linear layers to protect + train.
+       The classifier is never selectable."""
+    cand = [(n, m) for n, m in model.named_modules()
+            if isinstance(m, (nn.Conv2d, nn.Linear)) and n != "classifier"]
+    spec = spec.strip().lower()
+    if spec == "all":
+        sel = cand
+    elif spec == "conv":
+        sel = [(n, m) for n, m in cand if isinstance(m, nn.Conv2d)]
+    elif spec == "proj":
+        sel = [(n, m) for n, m in cand if n.endswith("proj")]
+    else:
+        keys = [k.strip() for k in spec.split(",") if k.strip()]
+        sel = [(n, m) for n, m in cand if any(k in n for k in keys)]
+    if not sel:
+        raise SystemExit(f"--layers '{spec}' selected no layers. "
+                         f"available: {[n for n,_ in cand]}")
+    return sel
+
+
+def layer_in_dim(module):
+    """Dimension of the space the projector lives in = the layer's input dim."""
+    if isinstance(module, nn.Linear):
+        return module.in_features
+    k = module.kernel_size
+    return module.in_channels * k[0] * k[1]
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  Per-layer covariance  (Adam-NSCL: svd_agent/svd_based.py)
+# ══════════════════════════════════════════════════════════════════════
+
+@torch.no_grad()
+def accumulate_covariances(model, loader, layers, args):
+    """Uncentered covariance of each selected layer's INPUT.
+         Linear : a^T a          Conv2d : im2col patches u^T u
+       Returns {name: [in_dim, in_dim]} on CPU (float64)."""
+    covs = {}
+
+    def hook_for(name, module):
+        def hook(mod, fin, fout):
+            a = fin[0].detach()
+            if isinstance(mod, nn.Linear):
+                a2 = a.reshape(-1, a.shape[-1])
+            else:
+                u = F.unfold(a, kernel_size=mod.kernel_size,
+                             padding=mod.padding, stride=mod.stride,
+                             dilation=mod.dilation)          # [B, C*k*k, L]
+                a2 = u.permute(0, 2, 1).reshape(-1, u.shape[1])
+            c = (a2.double().T @ a2.double()).cpu()
+            covs[name] = c if name not in covs else covs[name] + c
+        return hook
+
+    handles = [m.register_forward_hook(hook_for(n, m)) for n, m in layers]
+    model.eval()
+    for i, (x, _) in enumerate(loader):
+        if args.cov_batches and i >= args.cov_batches:
+            break
+        model.backbone(x.to(args.device))
+    for h in handles:
+        h.remove()
+    return covs
+
+
+def build_projectors(covs, layers, args):
+    """P_name = I - U_k U_k^T for each layer, Frobenius-normalised."""
+    Ps, info = {}, {}
+    for name, module in layers:
+        C = covs[name]
+        d = C.shape[0]
+        ev, U = torch.linalg.eigh(C)
+        ev = ev.flip(0).clamp_min(0)
+        U = U.flip(1).float()
+        cum = (ev / ev.sum().clamp_min(1e-30)).cumsum(0)
+        k_t = int((cum < args.energy).sum().item()) + 1
+        k = max(k_t, args.k0, int(round(args.k0_frac * d)))
+        k = min(k, d - 1)                      # always leave >=1 free direction
+        Uk = U[:, :k]
+        P = torch.eye(d) - Uk @ Uk.T
+        scale = 1.0
+        if args.proj_normalize == "frobenius":
+            scale = float(P.norm()); P = P / scale
+        part = float((ev.sum() ** 2) / (ev ** 2).sum().clamp_min(1e-30))
+        Ps[name] = P
+        info[name] = dict(d=d, k=k, k_t=k_t, free=d - k,
+                          energy_kept=float(cum[k - 1]),
+                          part_ratio=part, frob=scale)
+    return Ps, info
+
+
+@torch.no_grad()
+def layer_rho(model, loader, layers, Ps, args):
+    """Per layer: fraction of input energy that SURVIVES the projector.
+       Small on source => protected. Small on target => no room to adapt."""
+    num = defaultdict(float); den = defaultdict(float)
+
+    def hook_for(name, module, P):
+        def hook(mod, fin, fout):
+            a = fin[0].detach()
+            if isinstance(mod, nn.Linear):
+                a2 = a.reshape(-1, a.shape[-1])
+            else:
+                u = F.unfold(a, kernel_size=mod.kernel_size,
+                             padding=mod.padding, stride=mod.stride,
+                             dilation=mod.dilation)
+                a2 = u.permute(0, 2, 1).reshape(-1, u.shape[1])
+            a2 = a2.double(); Pd = P.to(a2.device).double()
+            num[name] += float((a2 @ Pd.T).pow(2).sum())
+            den[name] += float(a2.pow(2).sum())
+        return hook
+
+    handles = [m.register_forward_hook(hook_for(n, m, Ps[n])) for n, m in layers]
+    model.eval()
+    for i, (x, _) in enumerate(loader):
+        if args.cov_batches and i >= args.cov_batches:
+            break
+        model.backbone(x.to(args.device))
+    for h in handles:
+        h.remove()
+    return {n: num[n] / max(den[n], 1e-30) for n, _ in layers}
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  Feature extraction / evaluation
 # ══════════════════════════════════════════════════════════════════════
 
 @torch.no_grad()
 def extract_feats(model, loader, device):
-    """256-d features (backbone output) + labels — used for EER/R1."""
     model.eval()
     X, Y = [], []
     for x, y in loader:
-        X.append(model.backbone(x.to(device)).cpu())
-        Y.append(y)
+        X.append(model.backbone(x.to(device)).cpu()); Y.append(y)
     return torch.cat(X), torch.cat(Y)
-
-
-@torch.no_grad()
-def extract_pooled(model, loader, device):
-    """128-d POOLED vectors = proj's INPUT — the space the projector lives in."""
-    model.eval()
-    store, H = {}, []
-    h = model.backbone.proj.register_forward_hook(
-        lambda m, fin, fout: store.__setitem__("h", fin[0].detach()))
-    for x, _ in loader:
-        model.backbone(x.to(device))
-        H.append(store["h"].cpu())
-    h.remove()
-    return torch.cat(H)
 
 
 def evaluate_domain(model, gal_loader, prb_loader, device):
@@ -225,45 +330,7 @@ def evaluate_domain(model, gal_loader, prb_loader, device):
                               F.normalize(pf, dim=-1), pl)
 
 
-# ══════════════════════════════════════════════════════════════════════
-#  P2 — null-space projector
-# ══════════════════════════════════════════════════════════════════════
-
-def build_projector(H, k0, energy_thresh, normalize):
-    """P = I - U_k U_k^T from the uncentered covariance of pooled activations.
-       k = max(k0, k_t) where k_t holds `energy_thresh` of the target energy."""
-    d = H.size(1)
-    C = (H.double().T @ H.double()) / H.size(0)
-    ev, U = torch.linalg.eigh(C)
-    ev = ev.flip(0).clamp_min(0)
-    U = U.flip(1).float()
-
-    cum = (ev / ev.sum()).cumsum(0)
-    k_t = int((cum < energy_thresh).sum().item()) + 1
-    k = min(max(k0, k_t), d)
-
-    Uk = U[:, :k]
-    P = torch.eye(d) - Uk @ Uk.T
-    scale = 1.0
-    if normalize == "frobenius":
-        scale = float(P.norm())
-        P = P / scale
-    part = float((ev.sum() ** 2) / (ev ** 2).sum())
-    return P, dict(d=d, k=k, k_t=k_t, k0=k0, rank=d - k,
-                   energy_kept=float(cum[k - 1]), part_ratio=part,
-                   frob_scale=scale, eig=ev.tolist())
-
-
-def residual_ratio(H, P):
-    """rho = mean fraction of energy that SURVIVES the projector (free space).
-       Small rho => the projector kills almost everything => little room."""
-    Hd = H.double()
-    num = (Hd @ P.double().T).pow(2).sum(1)
-    den = Hd.pow(2).sum(1).clamp_min(1e-12)
-    return float((num / den).mean())
-
 def make_proj_pre_hook(M):
-    """forward_pre_hook that replaces proj's INPUT h with h @ M (M symmetric)."""
     def hook(module, inputs):
         h = inputs[0]
         return (h @ M.to(h.device, h.dtype),)
@@ -271,55 +338,43 @@ def make_proj_pre_hook(M):
 
 
 def evaluate_through_subspace(model, M, gal_loader, prb_loader, device):
-    """Evaluate with proj's input passed through the projector M."""
+    """Evaluate with proj's INPUT passed through M (used by the P2b check)."""
     h = model.backbone.proj.register_forward_pre_hook(make_proj_pre_hook(M))
     try:
         return evaluate_domain(model, gal_loader, prb_loader, device)
     finally:
         h.remove()
-      
+
+
 # ══════════════════════════════════════════════════════════════════════
-#  BN pack  (per-domain state: gamma, beta, running mean/var)
+#  BN pack (per-domain state)
 # ══════════════════════════════════════════════════════════════════════
 
 def snapshot_bn(model):
     pack = {}
     for name, m in model.named_modules():
         if isinstance(m, nn.BatchNorm2d):
-            pack[name] = {
-                "weight": m.weight.detach().clone(),
-                "bias": m.bias.detach().clone(),
-                "running_mean": m.running_mean.detach().clone(),
-                "running_var": m.running_var.detach().clone(),
-                "num_batches_tracked": m.num_batches_tracked.detach().clone(),
-            }
+            pack[name] = {k: getattr(m, k).detach().clone() for k in
+                          ("weight", "bias", "running_mean", "running_var",
+                           "num_batches_tracked")}
     return pack
 
 
 def restore_bn(model, pack):
     for name, m in model.named_modules():
         if isinstance(m, nn.BatchNorm2d) and name in pack:
-            s = pack[name]
-            m.weight.data.copy_(s["weight"])
-            m.bias.data.copy_(s["bias"])
-            m.running_mean.data.copy_(s["running_mean"])
-            m.running_var.data.copy_(s["running_var"])
-            m.num_batches_tracked.data.copy_(s["num_batches_tracked"])
+            for k, v in pack[name].items():
+                getattr(m, k).data.copy_(v)
 
 
 # ══════════════════════════════════════════════════════════════════════
-#  Projected Adam  (Adam-NSCL: project the UPDATE, not the gradient)
+#  Projected Adam (project the UPDATE, per Adam-NSCL)
 # ══════════════════════════════════════════════════════════════════════
 
 class ProjectedAdam(torch.optim.Optimizer):
-    """Adam whose update for registered params is right-multiplied by P:
-           update <- update @ P          ([out,in] @ [in,in])
-       mirroring optim/adam_svd.py of Adam-NSCL."""
-
-    def __init__(self, param_groups, betas=(0.9, 0.999), eps=1e-8,
-                 weight_decay=0.0):
-        defaults = dict(betas=betas, eps=eps, weight_decay=weight_decay)
-        super().__init__(param_groups, defaults)
+    def __init__(self, groups, betas=(0.9, 0.999), eps=1e-8, weight_decay=0.0):
+        super().__init__(groups, dict(betas=betas, eps=eps,
+                                      weight_decay=weight_decay))
         self.projectors = {}
 
     def set_projector(self, param, P):
@@ -344,23 +399,20 @@ class ProjectedAdam(torch.optim.Optimizer):
                 st["exp_avg"].mul_(b1).add_(grad, alpha=1 - b1)
                 st["exp_avg_sq"].mul_(b2).addcmul_(grad, grad, value=1 - b2)
                 denom = st["exp_avg_sq"].sqrt().add_(group["eps"])
-                bc1 = 1 - b1 ** st["step"]
-                bc2 = 1 - b2 ** st["step"]
-                step_size = group["lr"] * math.sqrt(bc2) / bc1
-                update = -step_size * st["exp_avg"] / denom
-                Pm = self.projectors.get(id(p))
-                if Pm is not None:                       # [out,in] @ [in,in]
-                    update = update @ Pm
-                p.add_(update)
+                bc1 = 1 - b1 ** st["step"]; bc2 = 1 - b2 ** st["step"]
+                upd = -(group["lr"] * math.sqrt(bc2) / bc1) * st["exp_avg"] / denom
+                P = self.projectors.get(id(p))
+                if P is not None:
+                    shp = upd.shape                      # conv: [O,I,kh,kw]
+                    upd = (upd.view(shp[0], -1) @ P.to(upd.device)).view(shp)
+                p.add_(upd)
 
 
 # ══════════════════════════════════════════════════════════════════════
-#  TENT loss + model configuration
+#  Loss + model configuration
 # ══════════════════════════════════════════════════════════════════════
 
 def entropy_loss(logits, conf_ratio):
-    """Mean entropy over CONFIDENT samples (H < conf_ratio * ln C).
-       Returns (loss, kept_fraction); loss is None if nothing passes."""
     p = logits.softmax(1)
     ent = -(p * p.clamp_min(1e-12).log()).sum(1)
     if conf_ratio >= 1.0:
@@ -371,86 +423,85 @@ def entropy_loss(logits, conf_ratio):
     return ent[mask].mean(), float(mask.float().mean())
 
 
-def configure_model(model, method, bn_mode):
-    """Freeze everything, then re-enable exactly the intended surfaces.
-         method 'tent'   -> BN affine only
-         method 'nsctta' -> BN affine (optional) + proj.weight (projected)
-       classifier and proj.bias are ALWAYS frozen."""
+def configure_model(model, arm, layers):
+    """Freeze everything, then enable exactly the intended surfaces.
+         tent      : BN affine + batch stats
+         nsctta    : projected layer weights, BN FROZEN
+         nsctta_bn : projected layer weights + BN affine + batch stats
+       classifier and all biases stay frozen."""
     model.eval()
     for p in model.parameters():
         p.requires_grad_(False)
 
-    bn_params, proj_params = [], []
+    bn_adapt = arm in ("tent", "nsctta_bn")
+    bn_params = []
     for m in model.modules():
         if isinstance(m, nn.BatchNorm2d):
-            if bn_mode == "adapt":
-                m.train()                       # batch stats + running update
-                m.weight.requires_grad_(True)
-                m.bias.requires_grad_(True)
+            if bn_adapt:
+                m.train()
+                m.weight.requires_grad_(True); m.bias.requires_grad_(True)
                 bn_params += [m.weight, m.bias]
             else:
-                m.eval()                        # frozen stats, frozen affine
+                m.eval()
 
-    if method == "nsctta":
-        w = model.backbone.proj.weight
-        w.requires_grad_(True)
-        proj_params.append(w)
-        # proj.bias stays frozen: dy = dW x + db, and db cannot be projected.
+    proj_params = []
+    if arm in ("nsctta", "nsctta_bn"):
+        for name, mod in layers:
+            mod.weight.requires_grad_(True)
+            proj_params.append((name, mod.weight))
+            # biases are never trained: db cannot be projected away
     return bn_params, proj_params
 
 
 # ══════════════════════════════════════════════════════════════════════
-#  The TTA loop
+#  TTA loop
 # ══════════════════════════════════════════════════════════════════════
 
-def run_tta(model, loader, args, method, P=None, tag=""):
-    bn_params, proj_params = configure_model(model, method, args.bn_mode)
-
+def run_tta(model, loader, args, arm, layers, Ps, tag=""):
+    bn_params, proj_params = configure_model(model, arm, layers)
     groups = []
     if bn_params:
         groups.append({"params": bn_params, "lr": args.lr})
     if proj_params:
-        groups.append({"params": proj_params, "lr": args.proj_lr})
+        groups.append({"params": [p for _, p in proj_params],
+                       "lr": args.proj_lr})
     if not groups:
-        print(f"    [{tag}] nothing trainable — skipping adaptation")
+        print(f"    [{tag}] nothing trainable — skipping")
         return {"steps": 0, "kept": 0.0, "loss": float("nan")}
 
     opt = ProjectedAdam(groups)
-    if method == "nsctta" and P is not None:
-        for w in proj_params:
-            opt.set_projector(w, P.to(args.device))
+    for name, w in proj_params:
+        opt.set_projector(w, Ps[name].to(args.device))
 
     n_ep = 1 if args.adapt_mode == "batch" else args.n_epochs
-    n_bn = len(bn_params) // 2
-    print(f"    [{tag}] trainable: {n_bn} BN layers"
-          f"{' + proj.weight (PROJECTED)' if proj_params else ''}"
-          f" | mode={args.adapt_mode} epochs={n_ep} bn={args.bn_mode}")
+    print(f"    [{tag}] BN layers={len(bn_params)//2}  "
+          f"projected layers={len(proj_params)}"
+          f"{' (' + ','.join(n for n,_ in proj_params) + ')' if proj_params else ''}"
+          f"  mode={args.adapt_mode} epochs={n_ep}")
 
     steps, tot_loss, tot_kept, skipped = 0, 0.0, 0.0, 0
     for ep in range(n_ep):
-        ep_loss, ep_kept, ep_steps = 0.0, 0.0, 0
+        el, ek, es = 0.0, 0.0, 0
         for x, _ in loader:
             x = x.to(args.device)
-            logits, _feat = model(x)
+            logits, _f = model(x)
             loss, kept = entropy_loss(logits, args.conf_ratio)
             if loss is None:
-                skipped += 1
-                continue
+                skipped += 1; continue
             opt.zero_grad(set_to_none=True)
             loss.backward()
             opt.step()
-            ep_loss += loss.item(); ep_kept += kept; ep_steps += 1
-        if ep_steps:
-            steps += ep_steps; tot_loss += ep_loss; tot_kept += ep_kept
+            el += loss.item(); ek += kept; es += 1
+        if es:
+            steps += es; tot_loss += el; tot_kept += ek
             if n_ep > 1:
-                print(f"      ep {ep+1}/{n_ep}: H={ep_loss/ep_steps:.4f}  "
-                      f"kept={100*ep_kept/ep_steps:.1f}%")
+                print(f"      ep {ep+1}/{n_ep}: H={el/es:.4f} kept={100*ek/es:.1f}%")
     if steps == 0:
-        print(f"    [{tag}] WARNING: every batch filtered out "
+        print(f"    [{tag}] WARNING: every batch filtered "
               f"(conf_ratio={args.conf_ratio} too strict)")
         return {"steps": 0, "kept": 0.0, "loss": float("nan")}
     print(f"    [{tag}] {steps} updates | mean H={tot_loss/steps:.4f} | "
-          f"kept={100*tot_kept/steps:.1f}% | skipped batches={skipped}")
+          f"kept={100*tot_kept/steps:.1f}% | skipped={skipped}")
     return {"steps": steps, "kept": tot_kept / steps, "loss": tot_loss / steps}
 
 
@@ -467,20 +518,20 @@ def main():
 
     print(f"\n{'='*78}")
     print(f"  SINGLE-TARGET TTA   source={args.source_spectrum}  "
-          f"target={args.target_spectrum}")
+          f"target={args.target_spectrum}   layers='{args.layers}'")
     print(f"{'='*78}")
 
-    # ── P0 ────────────────────────────────────────────────────────────
+    # ── P0 ───────────────────────────────────────────────────────────
     print(f"\n{'─'*78}\n  P0  Source model + closed-set splits\n{'─'*78}")
     all_samples = scan_dataset(args.data_dir)
     model, arch, train_id_map, n_cls = load_source_model(args, all_samples)
     img_size = arch["img_size"]
 
-    known = set(train_id_map)                       # closed-set restriction
-    src_all = [s for s in all_samples
-               if s["spectrum"] == args.source_spectrum and s["identity"] in known]
-    tgt_all = [s for s in all_samples
-               if s["spectrum"] == args.target_spectrum and s["identity"] in known]
+    known = set(train_id_map)
+    src_all = [s for s in all_samples if s["spectrum"] == args.source_spectrum
+               and s["identity"] in known]
+    tgt_all = [s for s in all_samples if s["spectrum"] == args.target_spectrum
+               and s["identity"] in known]
     if not tgt_all:
         raise SystemExit(f"no target samples for {args.target_spectrum}")
 
@@ -490,22 +541,22 @@ def main():
                                        args.gallery_ratio, args.seed)
     t_gal, t_prb = split_gallery_probe(tgt_test, train_id_map,
                                        args.gallery_ratio, args.seed)
-
-    print(f"  source '{args.source_spectrum}': {len(src_all)} imgs -> "
+    print(f"  source '{args.source_spectrum}': {len(src_all)} -> "
           f"adapt {len(src_adapt)} (unused) | test {len(src_test)} "
-          f"(gal {len(s_gal)} / prb {len(s_prb)})")
-    print(f"  target '{args.target_spectrum}': {len(tgt_all)} imgs -> "
+          f"(gal {len(s_gal)}/prb {len(s_prb)})")
+    print(f"  target '{args.target_spectrum}': {len(tgt_all)} -> "
           f"adapt {len(tgt_adapt)} | test {len(tgt_test)} "
-          f"(gal {len(t_gal)} / prb {len(t_prb)})")
-    print(f"  NOTE: source data is an ORACLE DIAGNOSTIC only — never adapted on.")
+          f"(gal {len(t_gal)}/prb {len(t_prb)})")
+    print(f"  NOTE: source data is an ORACLE DIAGNOSTIC only.")
 
     L = lambda s, sh=False: make_loader(s, train_id_map, img_size, args, sh)
-    tgt_adapt_loader = L(tgt_adapt, True)           # shuffled TTA stream
-    tgt_adapt_eval = L(tgt_adapt)                   # deterministic, for cov
+    tgt_stream = L(tgt_adapt, True)
+    tgt_cov = L(tgt_adapt)
+    src_cov = L(src_test)
     t_gal_l, t_prb_l = L(t_gal), L(t_prb)
     s_gal_l, s_prb_l = L(s_gal), L(s_prb)
 
-    # ── P1 ────────────────────────────────────────────────────────────
+    # ── P1 ───────────────────────────────────────────────────────────
     print(f"\n{'─'*78}\n  P1  Baselines (frozen source model)\n{'─'*78}")
     base_t = evaluate_domain(model, t_gal_l, t_prb_l, dev)
     base_s = evaluate_domain(model, s_gal_l, s_prb_l, dev)
@@ -513,115 +564,108 @@ def main():
     print(f"  SOURCE  EER={base_s['eer']:6.2f}%  R1={base_s['rank1']:6.2f}%")
     R["baseline"] = {"target": base_t, "source": base_s}
 
-    # ── P2 ────────────────────────────────────────────────────────────
-    print(f"\n{'─'*78}\n  P2  Null-space projector from TARGET activations\n{'─'*78}")
-    H_t = extract_pooled(model, tgt_adapt_eval, dev)
-    P, info = build_projector(H_t, args.k0, args.energy, args.proj_normalize)
-    print(f"  pooled activations (proj input): {tuple(H_t.shape)}")
-    print(f"  participation ratio = {info['part_ratio']:.1f} / {info['d']}")
-    print(f"  k_t@{args.energy:.0%} energy = {info['k_t']}   k0 = {info['k0']}"
-          f"   ->  k = {info['k']}   free rank = {info['rank']}")
-    print(f"  energy kept by top-{info['k']} = {info['energy_kept']:.4f}")
-    if args.proj_normalize == "frobenius":
-        print(f"  ||P||_F = {info['frob_scale']:.2f}  -> updates shrink ~"
-              f"{1/info['frob_scale']:.3f}x  (hence --proj_lr {args.proj_lr})")
+    # ── P2 ───────────────────────────────────────────────────────────
+    print(f"\n{'─'*78}\n  P2  Per-layer null-space projectors from TARGET"
+          f"\n{'─'*78}")
+    layers = select_layers(model, args.layers)
+    print(f"  selected {len(layers)} layer(s): "
+          f"{', '.join(f'{n}({layer_in_dim(m)}d)' for n, m in layers)}")
 
-    H_s = extract_pooled(model, L(src_test), dev)   # oracle diagnostic
-    rho_t, rho_s = residual_ratio(H_t, P), residual_ratio(H_s, P)
-    print(f"  rho (energy surviving P):  target={rho_t:.4f}   source={rho_s:.4f}")
-    print(f"    small source rho => P protects the source")
-    print(f"    small target rho => little room to adapt (watch this)")
-    R["projector"] = {k: v for k, v in info.items() if k != "eig"}
-    R["projector"].update({"rho_target": rho_t, "rho_source": rho_s})
+    covs = accumulate_covariances(model, tgt_cov, layers, args)
+    Ps, info = build_projectors(covs, layers, args)
+    rho_t = layer_rho(model, tgt_cov, layers, Ps, args)
+    rho_s = layer_rho(model, src_cov, layers, Ps, args)
 
-    # snapshot the SOURCE BN pack before any target batch touches BN
+    hdr = (f"  {'layer':<22}{'dim':>6}{'k_t':>6}{'k':>6}{'free':>6}"
+           f"{'E_kept':>9}{'part':>7}{'rho_tgt':>10}{'rho_src':>10}")
+    print(hdr); print("  " + "-" * (len(hdr) - 2))
+    for name, _m in layers:
+        i = info[name]
+        print(f"  {name:<22}{i['d']:6d}{i['k_t']:6d}{i['k']:6d}{i['free']:6d}"
+              f"{i['energy_kept']:9.4f}{i['part_ratio']:7.1f}"
+              f"{rho_t[name]:10.5f}{rho_s[name]:10.5f}")
+    print(f"  rho_src small => protected;  rho_tgt small => little room to adapt")
+    R["projector"] = {n: {**info[n], "rho_target": rho_t[n],
+                          "rho_source": rho_s[n]} for n, _ in layers}
+
     src_bn_pack = snapshot_bn(model)
     print(f"  snapshotted source BN pack: {len(src_bn_pack)} layers")
 
-    # ── P2b  Does the TARGET-derived subspace preserve the SOURCE? ──
-    print(f"\n{'─'*78}\n  P2b  Functional check: SOURCE through TARGET-derived "
-          f"subspace\n{'─'*78}")
-    d = info["d"]; k = info["k"]
-    # rebuild the un-normalised bases (P was Frobenius-scaled)
-    C = (H_t.double().T @ H_t.double()) / H_t.size(0)
-    ev_t, U_t = torch.linalg.eigh(C)
-    U_t = U_t.flip(1).float()
+    # ── P2b: does the TARGET-built subspace preserve the SOURCE? ──
+    if any(n.endswith("proj") for n, _ in layers):
+        print(f"\n{'─'*78}\n  P2b  SOURCE through TARGET-derived subspace "
+              f"(proj layer)\n{'─'*78}")
+        C = covs["backbone.proj"]
+        ev, U = torch.linalg.eigh(C); U = U.flip(1).float()
+        d = C.shape[0]
+        print(f"  {'k':>5} | {'src EER':>8} {'dEER':>7} | {'src R1':>8} "
+              f"{'dR1':>7} | {'tgt EER':>8} {'tgt R1':>8}")
+        curve = []
+        for kk in [k for k in (4, 8, 16, 24, 32, 48, 64, 96, d) if k <= d]:
+            Uk = U[:, :kk]; M = Uk @ Uk.T
+            rs = evaluate_through_subspace(model, M, s_gal_l, s_prb_l, dev)
+            rt = evaluate_through_subspace(model, M, t_gal_l, t_prb_l, dev)
+            de = rs["eer"] - base_s["eer"]; dr = rs["rank1"] - base_s["rank1"]
+            curve.append({"k": kk, "src_eer": rs["eer"], "src_rank1": rs["rank1"],
+                          "d_eer": de, "d_rank1": dr,
+                          "tgt_eer": rt["eer"], "tgt_rank1": rt["rank1"]})
+            mark = "  <-- k used" if kk == info["backbone.proj"]["k"] else ""
+            print(f"  {kk:5d} | {rs['eer']:8.2f} {de:+7.2f} | "
+                  f"{rs['rank1']:8.2f} {dr:+7.2f} | {rt['eer']:8.2f} "
+                  f"{rt['rank1']:8.2f}{mark}")
+        k_ok = next((c["k"] for c in curve if c["d_eer"] <= args.eps_src
+                     and c["d_rank1"] >= -args.eps_src), d)
+        print(f"  smallest k preserving source (±{args.eps_src}) = {k_ok}")
+        R["source_through_target_subspace"] = {"curve": curve, "k_ok": k_ok}
 
-    print(f"  {'k':>5} | {'src EER':>8} {'dEER':>7} | {'src R1':>8} {'dR1':>7} "
-          f"| {'tgt EER':>8} {'tgt R1':>8}")
-    curve = []
-    for kk in [k_ for k_ in (4, 8, 16, 24, 32, 48, 64, 96, d) if k_ <= d]:
-        Uk = U_t[:, :kk]
-        M_keep = Uk @ Uk.T                       # project ONTO the kept subspace
-        rs = evaluate_through_subspace(model, M_keep, s_gal_l, s_prb_l, dev)
-        rt = evaluate_through_subspace(model, M_keep, t_gal_l, t_prb_l, dev)
-        de = rs["eer"] - base_s["eer"]
-        dr = rs["rank1"] - base_s["rank1"]
-        curve.append({"k": kk, "src_eer": rs["eer"], "src_rank1": rs["rank1"],
-                      "d_eer": de, "d_rank1": dr,
-                      "tgt_eer": rt["eer"], "tgt_rank1": rt["rank1"]})
-        mark = "  <-- k used" if kk == k else ""
-        print(f"  {kk:5d} | {rs['eer']:8.2f} {de:+7.2f} | "
-              f"{rs['rank1']:8.2f} {dr:+7.2f} | "
-              f"{rt['eer']:8.2f} {rt['rank1']:8.2f}{mark}")
-
-    eps_src = 0.5
-    k_ok = next((c["k"] for c in curve
-                 if c["d_eer"] <= eps_src and c["d_rank1"] >= -eps_src), d)
-    print(f"  smallest k preserving source (±{args.eps_src}) = {k_ok}")
-    print(f"  if source survives at k={k}, the target-built P0 spans what the "
-          f"source needs => protection is justified")
-    R["source_through_target_subspace"] = {"curve": curve, "k_ok": k_ok}
-
-  
-    # ── P3 / P4 ───────────────────────────────────────────────────────
+    # ── P3..P5  arms ─────────────────────────────────────────────────
     results = {}
-    for arm, method in [("TENT", "tent"), ("NS-CTTA", "nsctta")]:
-        phase = "P3" if method == "tent" else "P4"
-        print(f"\n{'─'*78}\n  {phase}  Arm: {arm}\n{'─'*78}")
+    for i, arm in enumerate(args.arms):
+        print(f"\n{'─'*78}\n  P{3+i}  Arm: {arm.upper()}\n{'─'*78}")
         m = copy.deepcopy(model)
-        stats = run_tta(m, tgt_adapt_loader, args, method,
-                        P=P if method == "nsctta" else None, tag=arm)
+        m_layers = select_layers(m, args.layers)     # rebind to the copy
+        stats = run_tta(m, tgt_stream, args, arm, m_layers, Ps, tag=arm)
         r_t = evaluate_domain(m, t_gal_l, t_prb_l, dev)
         r_s = evaluate_domain(m, s_gal_l, s_prb_l, dev)
-        print(f"    TARGET  EER={r_t['eer']:6.2f}% ({r_t['eer']-base_t['eer']:+5.2f})"
-              f"   R1={r_t['rank1']:6.2f}% ({r_t['rank1']-base_t['rank1']:+5.2f})")
-        print(f"    SOURCE  EER={r_s['eer']:6.2f}% ({r_s['eer']-base_s['eer']:+5.2f})"
-              f"   R1={r_s['rank1']:6.2f}% ({r_s['rank1']-base_s['rank1']:+5.2f})")
-        results[arm] = {"target": r_t, "source": r_s, "stats": stats}
-
-        # ── P5: source recurrence — restore the source BN pack ──
-        if args.bn_mode == "adapt":
+        print(f"    TARGET  EER={r_t['eer']:6.2f}% "
+              f"({r_t['eer']-base_t['eer']:+5.2f})   "
+              f"R1={r_t['rank1']:6.2f}% ({r_t['rank1']-base_t['rank1']:+5.2f})")
+        print(f"    SOURCE  EER={r_s['eer']:6.2f}% "
+              f"({r_s['eer']-base_s['eer']:+5.2f})   "
+              f"R1={r_s['rank1']:6.2f}% ({r_s['rank1']-base_s['rank1']:+5.2f})")
+        entry = {"target": r_t, "source": r_s, "stats": stats}
+        if arm == "nsctta_bn":
             restore_bn(m, src_bn_pack)
             r_s2 = evaluate_domain(m, s_gal_l, s_prb_l, dev)
             print(f"    SOURCE after BN restore: EER={r_s2['eer']:6.2f}% "
                   f"({r_s2['eer']-base_s['eer']:+5.2f})   "
-                  f"R1={r_s2['rank1']:6.2f}% ({r_s2['rank1']-base_s['rank1']:+5.2f})")
-            results[arm]["source_bn_restored"] = r_s2
+                  f"R1={r_s2['rank1']:6.2f}% "
+                  f"({r_s2['rank1']-base_s['rank1']:+5.2f})")
+            entry["source_bn_restored"] = r_s2
+        results[arm] = entry
 
-    # ── P6 ────────────────────────────────────────────────────────────
-    print(f"\n{'='*78}\n  P6  RESULTS   (bn_mode={args.bn_mode}, "
+    # ── summary ──────────────────────────────────────────────────────
+    print(f"\n{'='*78}\n  RESULTS   (layers='{args.layers}', "
           f"adapt_mode={args.adapt_mode})\n{'='*78}")
-    hdr = (f"  {'model':<22}{'tgt EER':>9}{'tgt R1':>9}"
-           f"{'src EER':>10}{'src R1':>9}")
+    hdr = (f"  {'arm':<24}{'tgt EER':>9}{'tgt R1':>9}{'src EER':>10}{'src R1':>9}")
     print(hdr); print("  " + "-" * (len(hdr) - 2))
-    print(f"  {'source (no TTA)':<22}{base_t['eer']:9.2f}{base_t['rank1']:9.2f}"
+    print(f"  {'source (no TTA)':<24}{base_t['eer']:9.2f}{base_t['rank1']:9.2f}"
           f"{base_s['eer']:10.2f}{base_s['rank1']:9.2f}")
-    for arm in ("TENT", "NS-CTTA"):
+    for arm in args.arms:
         r = results[arm]
-        print(f"  {arm:<22}{r['target']['eer']:9.2f}{r['target']['rank1']:9.2f}"
+        print(f"  {arm:<24}{r['target']['eer']:9.2f}{r['target']['rank1']:9.2f}"
               f"{r['source']['eer']:10.2f}{r['source']['rank1']:9.2f}")
         if "source_bn_restored" in r:
             b = r["source_bn_restored"]
-            print(f"  {'  + BN restore':<22}{'—':>9}{'—':>9}"
+            print(f"  {'  + BN restore':<24}{'—':>9}{'—':>9}"
                   f"{b['eer']:10.2f}{b['rank1']:9.2f}")
+    print(f"\n  target columns = adaptation gain;  source columns = forgetting")
+    print(f"  'nsctta' isolates the projection (BN frozen); 'tent' isolates BN")
 
-    print(f"\n  read: target columns = adaptation gain;  "
-          f"source columns = forgetting")
     R["results"] = results
     jp = os.path.join(args.out_dir,
                       f"tta_{args.source_spectrum}_{args.target_spectrum}_"
-                      f"{args.bn_mode}_{args.adapt_mode}.json")
+                      f"{args.layers.replace(',','-')}_{args.adapt_mode}.json")
     with open(jp, "w") as f:
         json.dump(R, f, indent=2, default=float)
     print(f"\n  saved {jp}\n{'='*78}\n")
