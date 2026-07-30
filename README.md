@@ -1,4 +1,15 @@
+# Adam-NSCL for palmprint 
+### intra dataset
+python Adam_NSCL_palmprint.py --mode intra \
+    --data_dir /home/pai-ng/Jamal/CASIA-MS-ROI \
+    --task1_spectrum WHT --task2_spectrum 700
 
+### inter dataset
+python Adam_NSCL_palmprint.py --mode inter \
+    --data_dir /home/pai-ng/Jamal/CASIA-MS-ROI \
+    --xjtu_root /home/pai-ng/Jamal/XJTU-UP
+
+    
 
 # pretraining 
 
