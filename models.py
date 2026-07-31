@@ -35,6 +35,24 @@ def _gather(x, mask):
     return torch.gather(x, dim=1, index=idx)
 
 
+
+
+class SupervisedViT(nn.Module):
+    """JEPA's ViT encoder + a linear head, for supervised CE pretraining.
+       backbone(x) -> [B, embed_dim]  (same contract as CompNetBackbone),
+       forward(x)  -> (logits, feat)."""
+    def __init__(self, img_size, num_patches, embed_dim, n_classes):
+        super().__init__()
+        enc = ContextEncoder((img_size, img_size), num_patches, embed_dim)
+        self.backbone = FeatureExtractor(enc)   # wraps the encoder, pools -> [B,d]
+        self.classifier = nn.Linear(embed_dim, n_classes)
+
+    def forward(self, x):
+        feat = self.backbone(x)
+        return self.classifier(feat), feat
+
+
+
 # ══════════════════════════════════════════════════════════════
 #  Context Encoder
 # ══════════════════════════════════════════════════════════════
