@@ -35,9 +35,7 @@ def get_cfg(args=None):
 
     # ─── Method toggle ────────────────────────────────────────
     p.add_argument("--method", default="jepa",
-                   choices=["jepa", "compnet"],
-                   help="jepa = transformer + self-supervised; "
-                        "compnet = CNN + supervised CE on IDs")
+                   choices=["jepa", "compnet", "vit_sup"])
     # ─── CompNet (supervised) ─────────────────────────────────
     p.add_argument("--compnet_channels", type=int, default=16,
                    help="base channel width of the Gabor/competition block")
