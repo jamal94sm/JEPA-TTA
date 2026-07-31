@@ -326,12 +326,13 @@ def scan_xjtu(data_root):
                 if not os.path.isdir(id_dir):
                     continue
                 identity = f"XJTU_{id_folder}"
+                domain = f"{device}_{condition}"        # the XJTU "spectrum"
                 for fname in sorted(os.listdir(id_dir)):
                     if fname.lower().endswith(IMG_EXTS):
                         samples.append({
                             "path": os.path.join(id_dir, fname),
                             "identity": identity,
-                            "spectrum": "XJTU",
+                            "spectrum": domain,          # <- device_condition, not "XJTU"
                         })
                         ids.add(identity)
     print(f"  [XJTU] {len(samples)} samples, {len(ids)} identities from {data_root}")
