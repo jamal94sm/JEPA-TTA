@@ -37,7 +37,7 @@ from config import get_cfg
 from dataset import build_datasets
 from models import (ContextEncoder, TargetEncoder, Predictor,
                     FeatureExtractor, patchify, apply_masks,
-                    repeat_interleave_batch, update_ema, CompNet, PlainViT)
+                    repeat_interleave_batch, update_ema, CompNet, PlainViT, FeatModule)
 
 from evaluate import run_full_eval
 
