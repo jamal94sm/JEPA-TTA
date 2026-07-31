@@ -117,7 +117,7 @@ def get_args():
     p.add_argument("--augment", action="store_true", default=True)
     p.add_argument("--no_augment", dest="augment", action="store_false")
     p.add_argument("--arms", nargs="+",
-                   default=["frozen", "finetune", "ewc", "nscl", "nscl_bn"])
+                   default=["nscl_bn", "frozen", "finetune", "ewc", "nscl"])
     p.add_argument("--num_workers", type=int, default=4)
     p.add_argument("--device", default="cuda")
     p.add_argument("--seed", type=int, default=2025)
