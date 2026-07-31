@@ -88,6 +88,12 @@ def get_args():
     p.add_argument("--task2_spectrum", default="700")
     p.add_argument("--test_ratio", type=float, default=0.2)
     p.add_argument("--gallery_ratio", type=float, default=0.5)
+    p.add_argument("--intra_id_split", type=int, default=0,
+                   help="intra mode: task1 gets IDs [0:split], task2 gets the "
+                        "rest. 0 = split at half (100/100 for 200 IDs).")
+    p.add_argument("--inter_order", default="casia_first",
+                   choices=["casia_first", "xjtu_first"],
+                   help="inter mode: which dataset is task1")
     # model
     p.add_argument("--img_size", type=int, default=112)
     p.add_argument("--in_channels", type=int, default=3)
@@ -111,7 +117,7 @@ def get_args():
     p.add_argument("--augment", action="store_true", default=True)
     p.add_argument("--no_augment", dest="augment", action="store_false")
     p.add_argument("--arms", nargs="+",
-                   default=["frozen", "finetune", "ewc", "nscl"])
+                   default=["frozen", "finetune", "ewc", "nscl", "nscl_bn"])
     p.add_argument("--num_workers", type=int, default=4)
     p.add_argument("--device", default="cuda")
     p.add_argument("--seed", type=int, default=2025)
@@ -379,6 +385,24 @@ def ewc_loss(model, importance, old_params):
     return loss
 
 
+
+def snapshot_bn(model):
+    """Full BN state: affine params AND running buffers."""
+    pack = {}
+    for name, m in model.named_modules():
+        if isinstance(m, nn.BatchNorm2d):
+            pack[name] = {k: getattr(m, k).detach().clone() for k in
+                          ("weight", "bias", "running_mean", "running_var",
+                           "num_batches_tracked")}
+    return pack
+
+
+def restore_bn(model, pack):
+    for name, m in model.named_modules():
+        if isinstance(m, nn.BatchNorm2d) and name in pack:
+            for k, v in pack[name].items():
+                getattr(m, k).data.copy_(v)
+              
 # ══════════════════════════════════════════════════════════════════════
 #  DATA
 # ══════════════════════════════════════════════════════════════════════
@@ -401,29 +425,44 @@ def split_train_test(samples, test_ratio, seed):
 
 
 def build_tasks(args):
-    """Returns a list of two task dicts with their own id_map and splits."""
+    """Returns a list of two task dicts with their own id_map and splits.
+
+       intra : both tasks use ALL spectra; identities are split DISJOINTLY.
+               task1 = first half of IDs, task2 = second half. This makes the
+               two tasks a genuine class-incremental problem (no shared IDs, so
+               no backward transfer masking forgetting).
+       inter : task1/task2 are CASIA-MS(all) and XJTU-UP, order set by
+               --inter_order (casia_first | xjtu_first)."""
     casia = scan_dataset(args.data_dir)
     if args.mode == "intra":
-        s1 = [s for s in casia if s["spectrum"] == args.task1_spectrum]
-        s2 = [s for s in casia if s["spectrum"] == args.task2_spectrum]
-        names = (f"CASIA-{args.task1_spectrum}", f"CASIA-{args.task2_spectrum}")
+        ids = sorted({s["identity"] for s in casia})
+        n = len(ids)
+        cut = args.intra_id_split if args.intra_id_split > 0 else n // 2
+        ids1, ids2 = set(ids[:cut]), set(ids[cut:])
+        s1 = [s for s in casia if s["identity"] in ids1]   # all spectra, IDs 0..cut-1
+        s2 = [s for s in casia if s["identity"] in ids2]   # all spectra, IDs cut..n-1
+        names = (f"CASIA-IDs[0:{cut}]", f"CASIA-IDs[{cut}:{n}]")
     else:
         if scan_xjtu is None:
             raise SystemExit("inter mode needs scan_xjtu() in dataset.py")
-        s1 = casia
-        s2 = scan_xjtu(args.xjtu_root)
-        names = ("CASIA-MS(all)", "XJTU-UP")
+        xjtu = scan_xjtu(args.xjtu_root)
+        if args.inter_order == "xjtu_first":
+            s1, s2, names = xjtu, casia, ("XJTU-UP", "CASIA-MS(all)")
+        else:
+            s1, s2, names = casia, xjtu, ("CASIA-MS(all)", "XJTU-UP")
     if not s1 or not s2:
         raise SystemExit("one of the tasks has no samples")
 
     tasks = []
     for t, (samples, name) in enumerate(zip((s1, s2), names)):
-        id_map = build_id_map(samples)          # per-task label space
+        id_map = build_id_map(samples)          # per-task contiguous label space
         tr, te = split_train_test(samples, args.test_ratio, args.seed)
         gal, prb = split_gallery_probe(te, id_map, args.gallery_ratio, args.seed)
         tasks.append({"t": t, "name": name, "id_map": id_map,
                       "n_cls": len(id_map), "train": tr, "test": te,
                       "gal": gal, "prb": prb})
+        print(f"  task{t} '{name}': {len(samples)} imgs, {len(id_map)} IDs "
+              f"-> train {len(tr)} / test {len(te)}")
     return tasks
 
 
@@ -544,7 +583,8 @@ def main():
     print(f"  computing EWC importance on BN ...")
     importance = calculate_importance(model, cov_loader, 0, args)
     old_bn = {n: p.detach().clone() for n, p in bn_params(model).items()}
-
+    task1_bn_pack = snapshot_bn(model)          # full BN state (affine + buffers)
+  
     # ── TASK 2, one model copy per arm ────────────────────────────────
     results = {}
     for arm in args.arms:
@@ -554,14 +594,24 @@ def main():
         if arm == "frozen":
             print("    (no task-2 training)")
         else:
-            tr = transforms if arm == "nscl" else None
-            ew = (importance, old_bn) if arm in ("ewc", "nscl") else None
+            tr = transforms if arm in ("nscl", "nscl_bn") else None
+            ew = (importance, old_bn) if arm in ("ewc", "nscl", "nscl_bn") else None
             print(f"    projection={'ON' if tr else 'off'}   "
                   f"EWC={'ON' if ew else 'off'}   lr_backbone="
                   f"{args.svd_lr if tr else args.model_lr}")
             train_task(m, tasks[1], args, transforms=tr, ewc=ew, tag=arm)
 
+        # 1) task 2 evaluated with the ADAPTED (task-2) BN state
         r1 = eval_task(m, tasks[1], args)        # plasticity
+
+        # 2) for nscl_bn, swap in task-1 BN state BEFORE measuring task-1
+        if arm == "nscl_bn":
+            restore_bn(m, task1_bn_pack)
+            print(f"    restored task-1 BN pack ({len(task1_bn_pack)} layers) "
+                  f"before task-1 eval")
+
+        # 3) task 1 evaluated with (restored) task-1 BN for nscl_bn,
+        #    or the drifted BN for every other arm
         r0 = eval_task(m, tasks[0], args)        # retention
         d_eer = r0["eer"] - r00["eer"]
         d_r1 = r0["rank1"] - r00["rank1"]
