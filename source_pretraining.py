@@ -36,7 +36,7 @@ from config import get_cfg
 from dataset import build_datasets
 from models import (ContextEncoder, TargetEncoder, Predictor,
                     FeatureExtractor, patchify, apply_masks,
-                    repeat_interleave_batch, update_ema, CompNet, SupervisedViT)
+                    repeat_interleave_batch, update_ema, CompNet, PlainViT)
 
 from evaluate import run_full_eval
 
@@ -367,8 +367,9 @@ def train_compnet(cfg, train_loader, eval_dict, id_map, n_train_ids, train_id_ma
 
 def train_vit_sup(cfg, train_loader, eval_dict, id_map, n_train_ids, train_id_map):
     print(f"\n  Building Supervised ViT (JEPA encoder + CE head)...")
-    model = SupervisedViT(cfg.img_size, cfg.num_patches, cfg.embed_dim,
-                          n_train_ids).to(cfg.device)
+    model = PlainViT(img_size=cfg.img_size, patch_size=cfg.patch_size,
+                     embed_dim=cfg.embed_dim, depth=cfg.vit_depth,
+                     n_heads=cfg.vit_heads, n_classes=n_train_ids).to(cfg.device)
     n_par = sum(p.numel() for p in model.parameters())
     print(f"  SupervisedViT: {n_par/1e6:.2f}M params   n_classes={n_train_ids}")
 
@@ -447,7 +448,9 @@ def train_vit_sup(cfg, train_loader, eval_dict, id_map, n_train_ids, train_id_ma
                     "backbone": model.backbone.state_dict(),
                     "classifier": model.classifier.state_dict(),
                     "arch": {"embed_dim": cfg.embed_dim,
-                             "num_patches": cfg.num_patches,
+                             "patch_size": cfg.patch_size,
+                             "vit_depth": cfg.vit_depth,
+                             "vit_heads": cfg.vit_heads,
                              "img_size": cfg.img_size},
                     "train_id_map": train_id_map,
                     "n_train_ids": n_train_ids,
