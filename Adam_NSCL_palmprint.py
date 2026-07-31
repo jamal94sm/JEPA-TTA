@@ -106,12 +106,12 @@ def get_args():
     p.add_argument("--head_lr", type=float, default=1e-3)
     p.add_argument("--bn_lr", type=float, default=5e-4)
     p.add_argument("--weight_decay", type=float, default=5e-5)
-    p.add_argument("--batch_size", type=int, default=32)
+    p.add_argument("--batch_size", type=int, default=16)
     # NSCL / EWC
     p.add_argument("--svd_thres", type=float, default=10.0,
                    help="null space = eigenvalues <= thres * smallest")
     p.add_argument("--reg_coef", type=float, default=100.0, help="EWC on BN")
-    p.add_argument("--cov_batches", type=int, default=100,
+    p.add_argument("--cov_batches", type=int, default=50,
                    help="batches used to accumulate per-layer covariance")
     # misc
     p.add_argument("--augment", action="store_true", default=True)
