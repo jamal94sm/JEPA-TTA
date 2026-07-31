@@ -382,7 +382,7 @@ def train_vit_sup(cfg, train_loader, eval_dict, id_map, n_train_ids, train_id_ma
 
     # run_full_eval needs an object whose forward(x) -> [B, embed_dim];
     # for the ViT that is model.backbone = FeatureExtractor(encoder).
-    feature_extractor = model.backbone
+    feature_extractor = FeatModule(model)
 
     print(f"\n{'─'*70}")
     print(f"  Training Supervised ViT ({total_steps} steps, CE on IDs)")
@@ -446,7 +446,7 @@ def train_vit_sup(cfg, train_loader, eval_dict, id_map, n_train_ids, train_id_ma
                 torch.save({
                     "epoch": epoch,
                     "method": "vit_sup",
-                    "backbone": model.backbone.state_dict(),
+                    "full_state": model.state_dict(),
                     "classifier": model.classifier.state_dict(),
                     "arch": {"embed_dim": cfg.embed_dim,
                              "patch_size": cfg.patch_size,
