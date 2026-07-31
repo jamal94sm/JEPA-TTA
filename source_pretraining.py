@@ -14,6 +14,13 @@ collide (e.g. ./output_jepa vs ./output_compnet).
 python source_pretraining.py --method compnet --data_dir /home/pai-ng/Jamal/CASIA-MS-ROI --mode cross_domain_openset --train_spectrums WHT --output_dir ./output_compnet
 
 
+nohup python source_pretraining.py --method vit_sup \
+  --data_dir /home/pai-ng/Jamal/CASIA-MS-ROI \
+  --mode cross_domain_openset --train_spectrums WHT \
+  --output_dir ./output_vitsup > SupViT.log 2>&1 &
+
+  
+
 """
 
 import os
