@@ -259,21 +259,30 @@ def accumulate_covariance(model, loader, args, prev=None):
 
 
 def build_transforms(fea_in, thres, device):
-    """P = U_null U_null^T from the SMALLEST eigen-directions, then normalise
-       by ||P||_F   (optim/adam_svd.py: get_eigens + get_transforms)."""
-    transforms, info = {}, []
+    """P_null = U_null U_null^T (smallest eigen-directions), Frobenius-normalised
+       for AdamSVD.  Also return P_sub = U_sub U_sub^T (the COMPLEMENT, the
+       task-relevant subspace), UNnormalised, for reconstructing task-1 weights
+       as W2 @ P_sub after task 2."""
+    transforms, subspaces, info = {}, {}, []
     for p, cov in fea_in.items():
         U, S, _ = torch.linalg.svd(cov.cpu(), full_matrices=False)
-        # torch.svd returns S descending -> S[-1] is the smallest
+        # S descending -> S[-1] smallest.  keep = null-space directions.
         keep = S <= (S[-1] * thres)
-        if keep.sum() == 0:                     # degenerate: keep nothing
+        if keep.sum() == 0:
             keep[-1] = True
-        basis = U[:, keep].float()
-        P = basis @ basis.T
-        P = P / P.norm()                        # Frobenius normalisation
+        basis_null = U[:, keep].float()
+        basis_sub = U[:, ~keep].float()          # the COMPLEMENT = subspace
+
+        P = basis_null @ basis_null.T
+        P = P / P.norm()                          # normalised, for AdamSVD
         transforms[p] = P.to(device)
+
+        # UNnormalised, idempotent subspace projector for weight reconstruction
+        P_sub = basis_sub @ basis_sub.T           # = I - U_null U_null^T
+        subspaces[p] = P_sub.to(device)
+
         info.append((tuple(cov.shape), int(keep.sum()), cov.shape[0]))
-    return transforms, info
+    return transforms, subspaces, info
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -402,7 +411,23 @@ def restore_bn(model, pack):
         if isinstance(m, nn.BatchNorm2d) and name in pack:
             for k, v in pack[name].items():
                 getattr(m, k).data.copy_(v)
-              
+
+
+def restore_subspace(m, subspaces):
+    """Keep only each protected layer's task-1 SUBSPACE component:
+           W <- W @ P_sub          (P_sub idempotent, unnormalised)
+       Because NSCL kept task-2 movement in the null space, W2 @ P_sub
+       recovers task-1's subspace weights without needing stored W1."""
+    params = dict(m.named_parameters())
+    for name, P_sub in subspaces.items():
+        if name not in params:
+            continue
+        w = params[name].detach()
+        shp = w.shape
+        w_sub = (w.view(shp[0], -1) @ P_sub.to(w.device)).view(shp)
+        params[name].data.copy_(w_sub)
+
+
 # ══════════════════════════════════════════════════════════════════════
 #  DATA
 # ══════════════════════════════════════════════════════════════════════
@@ -568,7 +593,7 @@ def main():
     print(f"\n{'─'*78}\n  Building null-space projectors from task 1\n{'─'*78}")
     cov_loader = loader_of(tasks[0]["train"], tasks[0]["id_map"], args)
     fea_in = accumulate_covariance(model, cov_loader, args)
-    transforms, info = build_transforms(fea_in, args.svd_thres, dev)
+    transforms, subspaces, info = build_transforms(fea_in, args.svd_thres, dev)
     print(f"  layers projected: {len(transforms)}")
     for (shape, n_null, dim) in info[:6]:
         print(f"    cov {str(shape):>14}  null dims {n_null:4d}/{dim:<4d}"
@@ -584,6 +609,8 @@ def main():
     importance = calculate_importance(model, cov_loader, 0, args)
     old_bn = {n: p.detach().clone() for n, p in bn_params(model).items()}
     task1_bn_pack = snapshot_bn(model)          # full BN state (affine + buffers)
+    task1_weights = {n: p.detach().clone()          # task-1 weights, for subspace restore
+                     for n, p in model.named_parameters()}
   
     # ── TASK 2, one model copy per arm ────────────────────────────────
     results = {}
@@ -602,17 +629,18 @@ def main():
             train_task(m, tasks[1], args, transforms=tr, ewc=ew, tag=arm)
 
         # 1) task 2 evaluated with the ADAPTED (task-2) BN state
-        r1 = eval_task(m, tasks[1], args)        # plasticity
+        r1 = eval_task(m, tasks[1], args)       # plasticity
 
         # 2) for nscl_bn, swap in task-1 BN state BEFORE measuring task-1
         if arm == "nscl_bn":
-            restore_bn(m, task1_bn_pack)
-            print(f"    restored task-1 BN pack ({len(task1_bn_pack)} layers) "
-                  f"before task-1 eval")
+            restore_subspace(m, subspaces)        # W <- W @ P_sub  (drops null-space movement)
+            restore_bn(m, task1_bn_pack)          # task-1 BN statistics
+            print(f"    reconstructed task-1 subspace + restored BN before task-1 eval")
+
 
         # 3) task 1 evaluated with (restored) task-1 BN for nscl_bn,
         #    or the drifted BN for every other arm
-        r0 = eval_task(m, tasks[0], args)        # retention
+        r0 = eval_task(m, tasks[0], args)
         d_eer = r0["eer"] - r00["eer"]
         d_r1 = r0["rank1"] - r00["rank1"]
         print(f"    task2 (new)  EER={r1['eer']:6.2f}%  R1={r1['rank1']:6.2f}%")
