@@ -97,6 +97,15 @@ class PlainViT(nn.Module):
         return self.classifier(feat), feat
 
 
+class FeatModule(nn.Module):
+    """Wrap a model so forward(x) returns ONLY its feature — gives run_full_eval
+       an object with .eval() and __call__ that yields [B, embed_dim]."""
+    def __init__(self, model):
+        super().__init__()
+        self.model = model
+    def forward(self, x):
+        return self.model.backbone(x)      # PlainViT.backbone(x) -> [B, D]
+
 
 # ══════════════════════════════════════════════════════════════
 #  Context Encoder
