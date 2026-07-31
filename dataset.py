@@ -221,7 +221,11 @@ def build_datasets(cfg):
     """
     Returns: train_loader, eval_dict, id_map (global), n_train_ids
     """
-    all_samples = scan_dataset(cfg.data_dir)
+    if "xjtu" in cfg.data_dir.lower():
+        all_samples = scan_xjtu(cfg.data_dir)
+    else:
+        all_samples = scan_dataset(cfg.data_dir)
+        
     print(f"  Total samples: {len(all_samples)}")
     print(f"  Spectrums: {sorted(set(s['spectrum'] for s in all_samples))}")
     print(f"  Identities: {len(set(s['identity'] for s in all_samples))}")
