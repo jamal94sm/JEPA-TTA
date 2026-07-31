@@ -53,6 +53,51 @@ class SupervisedViT(nn.Module):
 
 
 
+class PlainViT(nn.Module):
+    """Standard supervised ViT — no masking, no JEPA pipeline.
+       backbone(x) -> [B, embed_dim]   (same contract as CompNetBackbone)
+       forward(x)  -> (logits, feat)."""
+    def __init__(self, img_size=112, patch_size=14, embed_dim=256,
+                 depth=6, n_heads=8, n_classes=160, in_ch=3, mlp_ratio=4.0):
+        super().__init__()
+        assert img_size % patch_size == 0, "img_size must be divisible by patch_size"
+        self.grid = img_size // patch_size
+        n_patches = self.grid * self.grid
+
+        # patch embedding via a strided conv (standard ViT stem)
+        self.patch_embed = nn.Conv2d(in_ch, embed_dim,
+                                     kernel_size=patch_size, stride=patch_size)
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
+        self.pos_embed = nn.Parameter(
+            torch.zeros(1, n_patches + 1, embed_dim))    # +1 for CLS
+        nn.init.trunc_normal_(self.pos_embed, std=0.02)
+        nn.init.trunc_normal_(self.cls_token, std=0.02)
+
+        enc_layer = nn.TransformerEncoderLayer(
+            d_model=embed_dim, nhead=n_heads,
+            dim_feedforward=int(embed_dim * mlp_ratio),
+            dropout=0.0, activation="gelu",
+            batch_first=True, norm_first=True)
+        self.encoder = nn.TransformerEncoder(enc_layer, depth)
+        self.norm = nn.LayerNorm(embed_dim)
+        self.classifier = nn.Linear(embed_dim, n_classes)
+
+    def backbone(self, x):
+        B = x.size(0)
+        z = self.patch_embed(x)                      # [B, D, g, g]
+        z = z.flatten(2).transpose(1, 2)             # [B, n_patches, D]
+        cls = self.cls_token.expand(B, -1, -1)       # [B, 1, D]
+        z = torch.cat([cls, z], dim=1) + self.pos_embed
+        z = self.encoder(z)
+        z = self.norm(z)
+        return z[:, 0]                               # CLS token -> [B, D]
+
+    def forward(self, x):
+        feat = self.backbone(x)
+        return self.classifier(feat), feat
+
+
+
 # ══════════════════════════════════════════════════════════════
 #  Context Encoder
 # ══════════════════════════════════════════════════════════════
