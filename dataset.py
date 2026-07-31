@@ -108,7 +108,9 @@ def split_mode_cross_domain_openset(samples, train_spectrums,
     n_train_ids = int(len(all_ids) * train_id_ratio)
     train_ids = set(all_ids[:n_train_ids])
     unseen_ids = set(all_ids[n_train_ids:])
-    unseen_spectrums = [s for s in ALL_SPECTRUMS if s not in train_spectrums]
+    # was: unseen_spectrums = [s for s in ALL_SPECTRUMS if s not in train_spectrums]
+    all_spectrums = sorted(set(s["spectrum"] for s in samples))
+    unseen_spectrums = [s for s in all_spectrums if s not in train_spectrums]
 
     # Training: ALL seen domains × seen IDs
     train = [s for s in samples
