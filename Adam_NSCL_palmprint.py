@@ -617,15 +617,18 @@ def main():
     # 1) baseline: task 1 as trained
     r_full = eval_task(model, tasks[0], args)          # expect ~10.3 EER
     
-    # 2) amputate: keep only the subspace part of task-1's OWN weights
-    params = dict(model.named_parameters())
-    for name, P_sub in subspaces.items():
-        w = params[name].detach()
+    # 2) amputate on a COPY so the arm loop's `model` stays intact
+    m_test = copy.deepcopy(model)
+    name_of = {id(p): n for n, p in model.named_parameters()}
+    cparams = dict(m_test.named_parameters())
+    for p, P_sub in subspaces.items():          # subspaces keyed by PARAM TENSOR
+        n = name_of.get(id(p))
+        if n is None or n not in cparams:
+            continue
+        w = cparams[n]
         shp = w.shape
-        params[name].data.copy_((w.view(shp[0], -1) @ P_sub.to(w.device)).view(shp))
-    
-    # BN is untouched — still task-1's own statistics
-    r_amputated = eval_task(model, tasks[0], args)     # expect BAD (~30+ EER)
+        w.data.copy_((w.data.view(shp[0], -1) @ P_sub.to(w.device)).view(shp))
+    r_amputated = eval_task(m_test, tasks[0], args)
     print(f"full W1: {r_full['eer']:.2f}   W1 @ P_sub: {r_amputated['eer']:.2f}")
 
 
