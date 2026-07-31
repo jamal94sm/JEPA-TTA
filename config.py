@@ -51,7 +51,14 @@ def get_cfg(args=None):
                    default=[0.10, 0.15])
     p.add_argument("--ctx_ratio", type=float, nargs=2,
                    default=[0.90, 1.00])
-
+    
+    ### Custom ViT for supervised pretraining
+    p.add_argument("--patch_size", type=int, default=14,
+                   help="ViT patch size; img_size must be divisible by it "
+                        "(112/14 = 8x8 = 64 patches)")
+    p.add_argument("--vit_depth", type=int, default=6)
+    p.add_argument("--vit_heads", type=int, default=8)
+    
     # ─── Training ─────────────────────────────────────────────
     p.add_argument("--epochs", type=int, default=200)
     p.add_argument("--batch_size", type=int, default=64)
