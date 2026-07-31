@@ -29,7 +29,8 @@ from config import get_cfg
 from dataset import build_datasets
 from models import (ContextEncoder, TargetEncoder, Predictor,
                     FeatureExtractor, patchify, apply_masks,
-                    repeat_interleave_batch, update_ema, CompNet)
+                    repeat_interleave_batch, update_ema, CompNet, SupervisedViT)
+
 from evaluate import run_full_eval
 
 
@@ -352,6 +353,125 @@ def train_compnet(cfg, train_loader, eval_dict, id_map, n_train_ids, train_id_ma
     print(f"\n  Saved: {save_path}")
 
 
+
+# ══════════════════════════════════════════════════════════════
+#  Supervised ViT (JEPA encoder + CE head on training IDs)
+# ══════════════════════════════════════════════════════════════
+
+def train_vit_sup(cfg, train_loader, eval_dict, id_map, n_train_ids, train_id_map):
+    print(f"\n  Building Supervised ViT (JEPA encoder + CE head)...")
+    model = SupervisedViT(cfg.img_size, cfg.num_patches, cfg.embed_dim,
+                          n_train_ids).to(cfg.device)
+    n_par = sum(p.numel() for p in model.parameters())
+    print(f"  SupervisedViT: {n_par/1e6:.2f}M params   n_classes={n_train_ids}")
+
+    opt = torch.optim.AdamW(model.parameters(), lr=cfg.learning_rate,
+                            weight_decay=cfg.weight_decay)
+    total_steps = cfg.epochs * len(train_loader)
+    scheduler = make_scheduler(opt, cfg, total_steps)
+    ce = torch.nn.CrossEntropyLoss(label_smoothing=cfg.label_smoothing)
+
+    # run_full_eval needs an object whose forward(x) -> [B, embed_dim];
+    # for the ViT that is model.backbone = FeatureExtractor(encoder).
+    feature_extractor = model.backbone
+
+    print(f"\n{'─'*70}")
+    print(f"  Training Supervised ViT ({total_steps} steps, CE on IDs)")
+    print(f"{'─'*70}")
+
+    global_step = 0
+    eval_history = []
+    best_eval = {"epoch": 0, "mean_rank1": 0.0, "mean_eer": float("inf")}
+
+    for epoch in range(1, cfg.epochs + 1):
+        model.train()
+        ep_loss, ep_correct, seen, n_bat = 0.0, 0, 0, 0
+        t0 = time.time()
+
+        for images, labels in train_loader:
+            images = images.to(cfg.device)
+            labels = labels.to(cfg.device)
+
+            logits, _feat = model(images)
+            loss = ce(logits, labels)
+
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+            scheduler.step()
+
+            global_step += 1
+            ep_loss += loss.item()
+            ep_correct += (logits.argmax(1) == labels).sum().item()
+            seen += labels.size(0)
+            n_bat += 1
+
+        ep_loss /= max(n_bat, 1)
+        ep_acc = 100.0 * ep_correct / max(seen, 1)
+        elapsed = time.time() - t0
+        lr_now = scheduler.get_last_lr()[0]
+
+        if epoch % 5 == 0 or epoch == cfg.epochs or epoch == 1:
+            print(f"  ep {epoch:03d}/{cfg.epochs}  CE={ep_loss:.4f}  "
+                  f"train_acc={ep_acc:.2f}%  lr={lr_now:.2e}  [{elapsed:.1f}s]")
+
+        if epoch % cfg.eval_every == 0 or epoch == cfg.epochs:
+            print(f"\n  ── Eval at epoch {epoch} ──")
+            model.eval()
+            eval_results = run_full_eval(
+                feature_extractor, eval_dict, cfg, tag=f"[ep{epoch}] ")
+
+            eval_entry = {"epoch": epoch, "ce": ep_loss, "train_acc": ep_acc}
+            mean_r1 = np.mean([r["rank1"] for r in eval_results.values()])
+            mean_eer = np.mean([r["eer"] for r in eval_results.values()])
+            eval_entry["mean_rank1"] = mean_r1
+            eval_entry["mean_eer"] = mean_eer
+            for name, r in eval_results.items():
+                eval_entry[name] = r
+            eval_history.append(eval_entry)
+
+            if mean_eer < best_eval["mean_eer"]:        # save on MIN EER
+                best_eval = {"epoch": epoch, "mean_rank1": mean_r1,
+                             "mean_eer": mean_eer}
+                ckpt_path = os.path.join(cfg.output_dir, ckpt_name(cfg))
+                torch.save({
+                    "epoch": epoch,
+                    "method": "vit_sup",
+                    "backbone": model.backbone.state_dict(),
+                    "classifier": model.classifier.state_dict(),
+                    "arch": {"embed_dim": cfg.embed_dim,
+                             "num_patches": cfg.num_patches,
+                             "img_size": cfg.img_size},
+                    "train_id_map": train_id_map,
+                    "n_train_ids": n_train_ids,
+                    "mean_rank1": mean_r1, "mean_eer": mean_eer,
+                }, ckpt_path)
+                print(f"    ★ New best EER={mean_eer:.2f}% "
+                      f"(R1={mean_r1:.2f}%) → saved")
+
+            print(f"    Summary: Mean R1={mean_r1:.2f}% | "
+                  f"Mean EER={mean_eer:.2f}%\n")
+
+    _print_history_compnet(eval_history, eval_dict)
+    _print_footer(cfg, best_eval)
+
+    save_path = os.path.join(cfg.output_dir,
+                             f"vitsup_{cfg.mode}_seed{cfg.seed}.json")
+    with open(save_path, "w") as f:
+        json.dump({
+            "mode": cfg.mode, "method": "vit_sup",
+            "config": {
+                "embed_dim": cfg.embed_dim,
+                "num_patches": cfg.num_patches,
+                "epochs": cfg.epochs,
+                "train_spectrums": cfg.train_spectrums,
+                "aug_multiplier": cfg.aug_multiplier,
+            },
+            "best": best_eval, "history": eval_history,
+        }, f, indent=2)
+    print(f"\n  Saved: {save_path}")
+
+
 # ══════════════════════════════════════════════════════════════
 #  History / footer printers
 # ══════════════════════════════════════════════════════════════
@@ -430,6 +550,8 @@ def main():
         train_jepa(cfg, train_loader, eval_dict, id_map, n_train_ids)
     elif cfg.method == "compnet":
         train_compnet(cfg, train_loader, eval_dict, id_map, n_train_ids, train_id_map)
+    elif cfg.method == "vit_sup":
+        train_vit_sup(cfg, train_loader, eval_dict, id_map, n_train_ids, train_id_map)
     else:
         raise SystemExit(f"unknown method: {cfg.method}")
 
