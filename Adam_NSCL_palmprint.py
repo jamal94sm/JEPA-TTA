@@ -611,7 +611,24 @@ def main():
     task1_bn_pack = snapshot_bn(model)          # full BN state (affine + buffers)
     task1_weights = {n: p.detach().clone()          # task-1 weights, for subspace restore
                      for n, p in model.named_parameters()}
-  
+
+
+    ######################## the effect of the projection on the task 1's performance
+    # 1) baseline: task 1 as trained
+    r_full = eval_task(model, tasks[0], args)          # expect ~10.3 EER
+    
+    # 2) amputate: keep only the subspace part of task-1's OWN weights
+    params = dict(model.named_parameters())
+    for name, P_sub in subspaces.items():
+        w = params[name].detach()
+        shp = w.shape
+        params[name].data.copy_((w.view(shp[0], -1) @ P_sub.to(w.device)).view(shp))
+    
+    # BN is untouched — still task-1's own statistics
+    r_amputated = eval_task(model, tasks[0], args)     # expect BAD (~30+ EER)
+    print(f"full W1: {r_full['eer']:.2f}   W1 @ P_sub: {r_amputated['eer']:.2f}")
+
+
     # ── TASK 2, one model copy per arm ────────────────────────────────
     results = {}
     for arm in args.arms:
