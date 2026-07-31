@@ -20,7 +20,11 @@ nohup python source_pretraining.py --method vit_sup \
   --patch_size 14 --vit_depth 6 --vit_heads 8 \
   --output_dir ./output_vitsup > SupViT.log 2>&1 &
 
-  
+nohup python source_pretraining.py --method vit_sup \
+  --data_dir /home/pai-ng/Jamal/XJTU-UP \
+  --mode cross_domain_openset --train_spectrums iPhone_Nature \
+  --patch_size 14 --vit_depth 6 --vit_heads 8 \
+  --output_dir ./output_vitsup_xjtu > SupViT.log 2>&1 &
 
 """
 
