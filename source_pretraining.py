@@ -17,6 +17,7 @@ python source_pretraining.py --method compnet --data_dir /home/pai-ng/Jamal/CASI
 nohup python source_pretraining.py --method vit_sup \
   --data_dir /home/pai-ng/Jamal/CASIA-MS-ROI \
   --mode cross_domain_openset --train_spectrums WHT \
+  --patch_size 14 --vit_depth 6 --vit_heads 8 \
   --output_dir ./output_vitsup > SupViT.log 2>&1 &
 
   
