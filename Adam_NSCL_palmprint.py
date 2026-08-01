@@ -634,7 +634,14 @@ def main():
     # after task 1 is trained and projectors are built:
     W1_snap = {n: p.detach().clone() for n, p in model.named_parameters()}
 
-  
+    # after build_transforms, before the arm loop:
+    p = list(transforms)[1]
+    Pn = transforms[p]        # training (null) projector
+    Ps = subspaces[p]         # reconstruction (subspace) projector
+    g = torch.randn(p.shape[0], Pn.shape[0], device=Pn.device)
+    projected = g @ Pn
+    print("subspace leak after projector =", ((projected @ Ps).norm()/projected.norm()).item())  
+
     # ── TASK 2, one model copy per arm ────────────────────────────────
     results = {}
     for arm in args.arms:
