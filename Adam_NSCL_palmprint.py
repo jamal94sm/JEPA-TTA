@@ -604,10 +604,9 @@ def main():
 
     # ---- Bug 3: do training and reconstruction cover the same layers? ----
     # ---- Bug 5: does eval use feature(), not a head? ---
-    if getattr(args, "debug", False):
-        print(f"    transforms layers: {len(transforms)}   subspaces layers: {len(subspaces)}")
-        print(f"    same keys: {set(map(id, transforms)) == set(map(id, subspaces))}")
-        import inspect; print(inspect.getsource(eval_task))
+    print(f"    transforms layers: {len(transforms)}   subspaces layers: {len(subspaces)}")
+    print(f"    same keys: {set(map(id, transforms)) == set(map(id, subspaces))}")
+    import inspect; print(inspect.getsource(eval_task))
 
   
     print(f"  layers projected: {len(transforms)}")
