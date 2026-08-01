@@ -529,6 +529,14 @@ def train_task(model, task, args, transforms=None, ewc=None, tag=""):
     opt = make_optimizer(model, args, t, transforms)
     sched = torch.optim.lr_scheduler.MultiStepLR(opt, args.schedule, args.gamma)
 
+    # ---- Bug 2 check: is every fea param actually projected? ----
+    if transforms is not None:
+        fea = [p for n, p in model.named_parameters()
+               if not re.match("last", n) and "bn" not in n and p.requires_grad]
+        have = sum(1 for p in fea if p in transforms)
+        print(f"    fea params: {len(fea)}   with transform: {have}   "
+              f"MISSING: {len(fea) - have}")
+
     for ep in range(1, args.epochs + 1):
         model.train()
         tot, corr, seen, nb = 0.0, 0, 0, 0
@@ -548,7 +556,6 @@ def train_task(model, task, args, transforms=None, ewc=None, tag=""):
             print(f"      [{tag}] ep {ep:3d}/{args.epochs}  "
                   f"loss={tot/max(nb,1):.4f}  train_acc={100*corr/max(seen,1):.2f}%")
     return model
-
 
 # ══════════════════════════════════════════════════════════════════════
 #  MAIN
@@ -594,6 +601,15 @@ def main():
     cov_loader = loader_of(tasks[0]["train"], tasks[0]["id_map"], args)
     fea_in = accumulate_covariance(model, cov_loader, args)
     transforms, subspaces, info = build_transforms(fea_in, args.svd_thres, dev)
+
+    # ---- Bug 3: do training and reconstruction cover the same layers? ----
+    # ---- Bug 5: does eval use feature(), not a head? ---
+    if getattr(args, "debug", False):
+        print(f"    transforms layers: {len(transforms)}   subspaces layers: {len(subspaces)}")
+        print(f"    same keys: {set(map(id, transforms)) == set(map(id, subspaces))}")
+        import inspect; print(inspect.getsource(eval_task))
+
+  
     print(f"  layers projected: {len(transforms)}")
     for (shape, n_null, dim) in info[:6]:
         print(f"    cov {str(shape):>14}  null dims {n_null:4d}/{dim:<4d}"
@@ -663,22 +679,29 @@ def main():
 
         # 2) for nscl_bn, swap in task-1 BN state BEFORE measuring task-1
         if arm == "nscl_bn":
-            # ---- LEAK CHECK: measure W2-W1 subspace component (before reconstruction) ----
+            # ---- LEAK CHECK: subspace component of W2-W1 (BEFORE reconstruction) ----
             name_of = {id(p): n for n, p in model.named_parameters()}
             mp = dict(m.named_parameters())
             tot = leak = 0.0
             for p_ref, P_sub in subspaces.items():
                 n = name_of.get(id(p_ref))
-                if n is None: continue
+                if n is None:
+                    continue
                 d = (mp[n].detach() - W1_snap[n].to(mp[n].device)).view(mp[n].shape[0], -1)
-                tot  += float(d.norm()**2)
-                leak += float((d @ P_sub.to(d.device)).norm()**2)
-            print(f"    LEAK ratio = {(leak/max(tot,1e-9))**0.5:.4f}  (0=clean, >0=leaked into subspace)")
-            # ---- then the actual reconstruction ----
+                tot  += float(d.norm() ** 2)
+                leak += float((d @ P_sub.to(d.device)).norm() ** 2)
+            print(f"    LEAK ratio = {(leak / max(tot, 1e-9)) ** 0.5:.4f}  "
+                  f"(0=clean, >0=leaked into subspace)")
+
+            # ---- reconstruction ----
             restore_subspace(m, subspaces, model)
             restore_bn(m, task1_bn_pack)
             print(f"    reconstructed task-1 subspace + restored BN before task-1 eval")
 
+            # ---- Bug 4 check: did the BN pack cover every BN layer? ----
+            n_bn = sum(isinstance(mo, torch.nn.BatchNorm2d) for mo in m.modules())
+            print(f"    BN coverage: pack has {len(task1_bn_pack)} layers, "
+                  f"model has {n_bn}  ({'OK' if len(task1_bn_pack) == n_bn else 'MISSING SOME'})")
 
         # 3) task 1 evaluated with (restored) task-1 BN for nscl_bn,
         #    or the drifted BN for every other arm
