@@ -413,19 +413,18 @@ def restore_bn(model, pack):
                 getattr(m, k).data.copy_(v)
 
 
-def restore_subspace(m, subspaces):
-    """Keep only each protected layer's task-1 SUBSPACE component:
-           W <- W @ P_sub          (P_sub idempotent, unnormalised)
-       Because NSCL kept task-2 movement in the null space, W2 @ P_sub
-       recovers task-1's subspace weights without needing stored W1."""
-    params = dict(m.named_parameters())
-    for name, P_sub in subspaces.items():
-        if name not in params:
+def restore_subspace(m, subspaces, ref_model):
+    """W <- W @ P_sub for each protected layer. subspaces is keyed by the
+       REFERENCE model's parameter tensors, so map them to m's params by NAME."""
+    name_of = {id(p): n for n, p in ref_model.named_parameters()}
+    mparams = dict(m.named_parameters())
+    for p_ref, P_sub in subspaces.items():
+        name = name_of.get(id(p_ref))
+        if name is None or name not in mparams:
             continue
-        w = params[name].detach()
+        w = mparams[name]
         shp = w.shape
-        w_sub = (w.view(shp[0], -1) @ P_sub.to(w.device)).view(shp)
-        params[name].data.copy_(w_sub)
+        w.data.copy_((w.data.view(shp[0], -1) @ P_sub.to(w.device)).view(shp))
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -653,7 +652,7 @@ def main():
 
         # 2) for nscl_bn, swap in task-1 BN state BEFORE measuring task-1
         if arm == "nscl_bn":
-            restore_subspace(m, subspaces)        # W <- W @ P_sub  (drops null-space movement)
+            restore_subspace(m, subspaces, model)        # W <- W @ P_sub  (drops null-space movement)
             restore_bn(m, task1_bn_pack)          # task-1 BN statistics
             print(f"    reconstructed task-1 subspace + restored BN before task-1 eval")
 
