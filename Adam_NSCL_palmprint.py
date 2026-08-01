@@ -414,10 +414,9 @@ def restore_bn(model, pack):
 
 
 def restore_subspace(m, subspaces, ref_model):
-    """W <- W @ P_sub for each protected layer. subspaces is keyed by the
-       REFERENCE model's parameter tensors, so map them to m's params by NAME."""
     name_of = {id(p): n for n, p in ref_model.named_parameters()}
     mparams = dict(m.named_parameters())
+    applied = 0
     for p_ref, P_sub in subspaces.items():
         name = name_of.get(id(p_ref))
         if name is None or name not in mparams:
@@ -425,6 +424,8 @@ def restore_subspace(m, subspaces, ref_model):
         w = mparams[name]
         shp = w.shape
         w.data.copy_((w.data.view(shp[0], -1) @ P_sub.to(w.device)).view(shp))
+        applied += 1
+    print(f"    restore_subspace: projected {applied}/{len(subspaces)} layers")
 
 
 # ══════════════════════════════════════════════════════════════════════
