@@ -631,7 +631,10 @@ def main():
     r_amputated = eval_task(m_test, tasks[0], args)
     print(f"full W1: {r_full['eer']:.2f}   W1 @ P_sub: {r_amputated['eer']:.2f}")
 
+    # after task 1 is trained and projectors are built:
+    W1_snap = {n: p.detach().clone() for n, p in model.named_parameters()}
 
+  
     # ── TASK 2, one model copy per arm ────────────────────────────────
     results = {}
     for arm in args.arms:
@@ -653,8 +656,20 @@ def main():
 
         # 2) for nscl_bn, swap in task-1 BN state BEFORE measuring task-1
         if arm == "nscl_bn":
-            restore_subspace(m, subspaces, model)        # W <- W @ P_sub  (drops null-space movement)
-            restore_bn(m, task1_bn_pack)          # task-1 BN statistics
+            # ---- LEAK CHECK: measure W2-W1 subspace component (before reconstruction) ----
+            name_of = {id(p): n for n, p in model.named_parameters()}
+            mp = dict(m.named_parameters())
+            tot = leak = 0.0
+            for p_ref, P_sub in subspaces.items():
+                n = name_of.get(id(p_ref))
+                if n is None: continue
+                d = (mp[n].detach() - W1_snap[n].to(mp[n].device)).view(mp[n].shape[0], -1)
+                tot  += float(d.norm()**2)
+                leak += float((d @ P_sub.to(d.device)).norm()**2)
+            print(f"    LEAK ratio = {(leak/max(tot,1e-9))**0.5:.4f}  (0=clean, >0=leaked into subspace)")
+            # ---- then the actual reconstruction ----
+            restore_subspace(m, subspaces, model)
+            restore_bn(m, task1_bn_pack)
             print(f"    reconstructed task-1 subspace + restored BN before task-1 eval")
 
 
