@@ -51,7 +51,7 @@ python Adam_NSCL_palmprint.py --mode inter \
     --data_dir /home/pai-ng/Jamal/CASIA-MS-ROI \
     --xjtu_root /home/pai-ng/Jamal/XJTU-UP
 
-nohup python Adam_NSCL_palmprint.py --mode intra --data_dir /home/pai-ng/Jamal/CASIA-MS-ROI --batch_size 8 --cov_batches 100 > adam-nscl.log 2>&1 &
+nohup python Adam_NSCL_palmprint.py --mode intra --data_dir /home/pai-ng/Jamal/CASIA-MS-ROI --batch_size 8 --cov_batches 100 --arms nscl_bn frozen finetune nscl --svd_thres 100 > adam-nscl.log 2>&1 &
 
 
 """
