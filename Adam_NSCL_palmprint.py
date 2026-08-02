@@ -213,21 +213,23 @@ class CovarianceAccumulator:
     def __init__(self, model):
         self.fea_in = {}
         self.handles = []
-        # exactly the reference's selection: modules with weight, excluding head
-        self.modules = [m for n, m in model.named_modules()
-                        if isinstance(m, (nn.Conv2d, nn.Linear))
-                        and not bool(re.match("last", n))]
+        self.mod_name = {}                     # module -> "name.weight"
+        self.modules = []
+        for n, m in model.named_modules():
+            if isinstance(m, (nn.Conv2d, nn.Linear)) and not bool(re.match("last", n)):
+                self.modules.append(m)
+                self.mod_name[m] = n + ".weight"
 
     def _hook(self, module, fea_in, fea_out):
         x = fea_in[0].detach()
         if isinstance(module, nn.Linear):
             X = x.reshape(-1, x.size(-1))
-        else:                                   # Conv2d -> im2col patch space
+        else:
             X = F.unfold(x, module.kernel_size, module.dilation,
-                         module.padding, module.stride)        # [B, Ckk, L]
-            X = X.permute(0, 2, 1).reshape(-1, X.size(1))      # [B*L, Ckk]
+                         module.padding, module.stride)
+            X = X.permute(0, 2, 1).reshape(-1, X.size(1))
         cov = X.T @ X
-        k = module.weight
+        k = self.mod_name[module]              # NAME string, not module.weight
         self.fea_in[k] = cov.double() if k not in self.fea_in \
             else self.fea_in[k] + cov.double()
 
@@ -292,13 +294,16 @@ def build_transforms(fea_in, thres, device):
 class AdamSVD(torch.optim.Optimizer):
     def __init__(self, params, lr=1e-3, betas=(0.9, 0.999), eps=1e-8,
                  weight_decay=0.0, svd=False):
-        defaults = dict(lr=lr, betas=betas, eps=eps,
-                        weight_decay=weight_decay, svd=svd)
-        super().__init__(params, defaults)
+        super().__init__(params, dict(lr=lr, betas=betas, eps=eps,
+                                      weight_decay=weight_decay, svd=svd))
         self.transforms = {}
+        self.pname = {}                        # id(param) -> name
 
     def set_transforms(self, transforms):
         self.transforms = transforms
+
+    def set_names(self, name_map):             # id(param) -> name
+        self.pname = name_map
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -320,30 +325,25 @@ class AdamSVD(torch.optim.Optimizer):
                 st["exp_avg"].mul_(b1).add_(grad, alpha=1 - b1)
                 st["exp_avg_sq"].mul_(b2).addcmul_(grad, grad, value=1 - b2)
                 denom = st["exp_avg_sq"].sqrt().add_(group["eps"])
-                bc1 = 1 - b1 ** st["step"]
-                bc2 = 1 - b2 ** st["step"]
+                bc1 = 1 - b1 ** st["step"]; bc2 = 1 - b2 ** st["step"]
                 step_size = group["lr"] * math.sqrt(bc2) / bc1
                 update = -step_size * st["exp_avg"] / denom
-                if svd and p in self.transforms:
-                    P = self.transforms[p]
+                name = self.pname.get(id(p))
+                if svd and name is not None and name in self.transforms:
+                    P = self.transforms[name]
                     shape = update.shape
-                    upd = update.view(shape[0], -1)      # [out, in(*k*k)]
-                    update = (upd @ P).view(shape)
+                    update = (update.view(shape[0], -1) @ P).view(shape)
                 p.add_(update)
 
 
 def make_optimizer(model, args, task, transforms=None):
-    """Reference parameter grouping: backbone (svd) / heads / BN."""
     fea, head, bn = [], [], []
     for n, p in model.named_parameters():
         if not p.requires_grad:
             continue
-        if re.match("last", n):
-            head.append(p)
-        elif "bn" in n:
-            bn.append(p)
-        else:
-            fea.append(p)
+        if re.match("last", n):   head.append(p)
+        elif "bn" in n:           bn.append(p)
+        else:                     fea.append(p)
     lr_fea = args.model_lr if task == 0 else args.svd_lr
     groups = [
         {"params": fea, "lr": lr_fea, "svd": transforms is not None},
@@ -353,6 +353,7 @@ def make_optimizer(model, args, task, transforms=None):
     opt = AdamSVD(groups, weight_decay=args.weight_decay)
     if transforms is not None:
         opt.set_transforms(transforms)
+        opt.set_names({id(p): n for n, p in model.named_parameters()})   # THIS model's params
     return opt
 
 
@@ -413,19 +414,15 @@ def restore_bn(model, pack):
                 getattr(m, k).data.copy_(v)
 
 
-def restore_subspace(m, subspaces, ref_model):
-    name_of = {id(p): n for n, p in ref_model.named_parameters()}
-    mparams = dict(m.named_parameters())
-    applied = 0
-    for p_ref, P_sub in subspaces.items():
-        name = name_of.get(id(p_ref))
-        if name is None or name not in mparams:
-            continue
-        w = mparams[name]
-        shp = w.shape
-        w.data.copy_((w.data.view(shp[0], -1) @ P_sub.to(w.device)).view(shp))
-        applied += 1
-    print(f"    restore_subspace: projected {applied}/{len(subspaces)} layers")
+def restore_subspace(m, subspaces):
+      mp = dict(m.named_parameters())
+      applied = 0
+      for name, P_sub in subspaces.items():
+          if name not in mp: continue
+          w = mp[name]; shp = w.shape
+          w.data.copy_((w.data.view(shp[0], -1) @ P_sub.to(w.device)).view(shp))
+          applied += 1
+      print(f"    restore_subspace: projected {applied}/{len(subspaces)} layers")
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -531,11 +528,11 @@ def train_task(model, task, args, transforms=None, ewc=None, tag=""):
 
     # ---- Bug 2 check: is every fea param actually projected? ----
     if transforms is not None:
-        fea = [p for n, p in model.named_parameters()
-               if not re.match("last", n) and "bn" not in n and p.requires_grad]
-        have = sum(1 for p in fea if p in transforms)
-        print(f"    fea params: {len(fea)}   with transform: {have}   "
-              f"MISSING: {len(fea) - have}")
+        names = [n for n, p in model.named_parameters()
+                 if not re.match("last", n) and "bn" not in n and p.requires_grad]
+        have = sum(1 for nm in names if nm in transforms)
+        print(f"    fea params: {len(names)}   with transform: {have}   "
+              f"MISSING: {len(names) - have}")
 
     for ep in range(1, args.epochs + 1):
         model.train()
@@ -631,31 +628,32 @@ def main():
     ######################## the effect of the projection on the task 1's performance
     # 1) baseline: task 1 as trained
     r_full = eval_task(model, tasks[0], args)          # expect ~10.3 EER
-    
-    # 2) amputate on a COPY so the arm loop's `model` stays intact
+
+    # 2) amputate on a COPY so the arm loop's `model` stays intact.
+    #    subspaces is now keyed by NAME, so index the copy's params directly.
     m_test = copy.deepcopy(model)
-    name_of = {id(p): n for n, p in model.named_parameters()}
     cparams = dict(m_test.named_parameters())
-    for p, P_sub in subspaces.items():          # subspaces keyed by PARAM TENSOR
-        n = name_of.get(id(p))
-        if n is None or n not in cparams:
+    for name, P_sub in subspaces.items():              # keyed by NAME
+        if name not in cparams:
             continue
-        w = cparams[n]
+        w = cparams[name]
         shp = w.shape
         w.data.copy_((w.data.view(shp[0], -1) @ P_sub.to(w.device)).view(shp))
     r_amputated = eval_task(m_test, tasks[0], args)
     print(f"full W1: {r_full['eer']:.2f}   W1 @ P_sub: {r_amputated['eer']:.2f}")
 
-    # after task 1 is trained and projectors are built:
+    # snapshot task-1 weights (by name) for the later LEAK check
     W1_snap = {n: p.detach().clone() for n, p in model.named_parameters()}
 
-    # after build_transforms, before the arm loop:
-    p = list(transforms)[1]
-    Pn = transforms[p]        # training (null) projector
-    Ps = subspaces[p]         # reconstruction (subspace) projector
-    g = torch.randn(p.shape[0], Pn.shape[0], device=Pn.device)
+    # projector self-test: applying the training (null) projector should leave
+    # ~0 energy in the subspace.  transforms is keyed by NAME now.
+    some_name = list(transforms)[1]
+    Pn = transforms[some_name]        # null projector
+    Ps = subspaces[some_name]         # subspace projector
+    g = torch.randn(4, Pn.shape[0], device=Pn.device)   # 4 = arbitrary out-dim
     projected = g @ Pn
-    print("subspace leak after projector =", ((projected @ Ps).norm()/projected.norm()).item())  
+    print("subspace leak after projector =",
+          ((projected @ Ps).norm() / projected.norm()).item())
 
     # ── TASK 2, one model copy per arm ────────────────────────────────
     results = {}
@@ -678,22 +676,18 @@ def main():
 
         # 2) for nscl_bn, swap in task-1 BN state BEFORE measuring task-1
         if arm == "nscl_bn":
-            # ---- LEAK CHECK: subspace component of W2-W1 (BEFORE reconstruction) ----
-            name_of = {id(p): n for n, p in model.named_parameters()}
             mp = dict(m.named_parameters())
             tot = leak = 0.0
-            for p_ref, P_sub in subspaces.items():
-                n = name_of.get(id(p_ref))
-                if n is None:
+            for name, P_sub in subspaces.items():          # keyed by NAME
+                if name not in mp:
                     continue
-                d = (mp[n].detach() - W1_snap[n].to(mp[n].device)).view(mp[n].shape[0], -1)
+                d = (mp[name].detach() - W1_snap[name].to(mp[name].device)
+                     ).view(mp[name].shape[0], -1)
                 tot  += float(d.norm() ** 2)
                 leak += float((d @ P_sub.to(d.device)).norm() ** 2)
             print(f"    LEAK ratio = {(leak / max(tot, 1e-9)) ** 0.5:.4f}  "
                   f"(0=clean, >0=leaked into subspace)")
-
-            # ---- reconstruction ----
-            restore_subspace(m, subspaces, model)
+            restore_subspace(m, subspaces)                 # no ref_model arg now
             restore_bn(m, task1_bn_pack)
             print(f"    reconstructed task-1 subspace + restored BN before task-1 eval")
 
