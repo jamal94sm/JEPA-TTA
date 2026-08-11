@@ -56,8 +56,14 @@ def set_seed(seed):
 def ckpt_name(cfg):
     """ckpt_{dataset}_{method}_{source_domain}.pth"""
     dataset = os.path.basename(os.path.normpath(cfg.data_dir)).lower()
-    dataset = "casiams" if "casia" in dataset else ("xjtu" if "xjtu" in dataset
-                                                    else dataset)
+    
+    if "casia" in dataset:
+        dataset = "casiams"
+    elif "xjtu" in dataset:
+        dataset = "xjtu"
+    elif "xpalm" in dataset:
+        dataset = "xpalm"
+        
     domain = "-".join(cfg.train_spectrums) if cfg.train_spectrums else "all"
     return f"ckpt_{dataset}_{cfg.method}_{domain}.pth"
 
