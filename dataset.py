@@ -297,6 +297,75 @@ def build_datasets(cfg):
     # in build_datasets, the return line:
     return train_loader, eval_dict, id_map, n_train_ids, train_id_map
 
+
+#######################################################
+################################## X-Palm Dataset
+#########################################################
+def scan_xpalm(data_root):
+    """
+    Scan X-Palm dataset (scanner_roi + smartphone_roi).
+    Returns a flat list of sample dicts so it integrates with CASIADataset.
+    """
+    import os
+    IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp"}
+    samples = []
+    ids = set()
+
+    # Parse Scanner Data
+    scanner_dir = os.path.join(data_root, "scanner_roi")
+    if os.path.isdir(scanner_dir):
+        for subj_folder in sorted(os.listdir(scanner_dir)):
+            subj_dir = os.path.join(scanner_dir, subj_folder)
+            if not os.path.isdir(subj_dir):
+                continue
+            subj_id = subj_folder
+            for fname in sorted(os.listdir(subj_dir)):
+                if os.path.splitext(fname)[1].lower() not in IMG_EXTS:
+                    continue
+                parts = os.path.splitext(fname)[0].split("_")
+                if len(parts) < 4:
+                    continue
+                
+                hand = parts[1].lower()
+                spectrum = parts[2].lower()
+                identity = f"XPALM_{subj_id}_{hand}"
+                
+                samples.append({
+                    "path": os.path.join(subj_dir, fname),
+                    "identity": identity,
+                    "spectrum": spectrum
+                })
+                ids.add(identity)
+
+    # Parse Smartphone Data
+    phone_dir = os.path.join(data_root, "smartphone_roi")
+    if os.path.isdir(phone_dir):
+        for subj_folder in sorted(os.listdir(phone_dir)):
+            subj_dir = os.path.join(phone_dir, subj_folder)
+            if not os.path.isdir(subj_dir):
+                continue
+            subj_id = subj_folder
+            for fname in sorted(os.listdir(subj_dir)):
+                if os.path.splitext(fname)[1].lower() not in IMG_EXTS:
+                    continue
+                parts = os.path.splitext(fname)[0].split("_")
+                if len(parts) < 3:
+                    continue
+                
+                hand = parts[1].lower()
+                variation = "_".join(parts[2:]).lower()
+                identity = f"XPALM_{subj_id}_{hand}"
+                
+                samples.append({
+                    "path": os.path.join(subj_dir, fname),
+                    "identity": identity,
+                    "spectrum": variation
+                })
+                ids.add(identity)
+
+    print(f"  [X-Palm] {len(samples)} samples, {len(ids)} identities from {data_root}")
+    return samples
+    
 # ========================================================
 #XJTU-UP dataset
 # ============================================================
