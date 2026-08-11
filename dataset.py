@@ -80,7 +80,8 @@ def split_mode_cross_domain(samples, train_spectrums, seed=2025):
     Eval on each unseen domain separately.
     Returns: train_samples, {"460": [...], "630": [...], ...}
     """
-    unseen_spectrums = [s for s in ALL_SPECTRUMS if s not in train_spectrums]
+    all_spectrums = sorted(set(s["spectrum"] for s in samples))
+    unseen_spectrums = [s for s in all_spectrums if s not in train_spectrums]
 
     train = [s for s in samples if s["spectrum"] in train_spectrums]
 
@@ -306,14 +307,14 @@ def build_datasets(cfg):
 def scan_xpalm(data_root):
     """
     Scan X-Palm dataset (scanner_roi + smartphone_roi).
-    Returns a flat list of sample dicts so it integrates with CASIADataset.
+    Domains are simplified strictly to 'scanner' and 'smartphone'.
     """
     import os
     IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp"}
     samples = []
     ids = set()
 
-    # Parse Scanner Data
+    # Parse Scanner Data -> Domain: "scanner"
     scanner_dir = os.path.join(data_root, "scanner_roi")
     if os.path.isdir(scanner_dir):
         for subj_folder in sorted(os.listdir(scanner_dir)):
@@ -329,17 +330,16 @@ def scan_xpalm(data_root):
                     continue
                 
                 hand = parts[1].lower()
-                spectrum = parts[2].lower()
                 identity = f"XPALM_{subj_id}_{hand}"
                 
                 samples.append({
                     "path": os.path.join(subj_dir, fname),
                     "identity": identity,
-                    "spectrum": spectrum
+                    "spectrum": "scanner"  # <-- Hardcoded domain
                 })
                 ids.add(identity)
 
-    # Parse Smartphone Data
+    # Parse Smartphone Data -> Domain: "smartphone"
     phone_dir = os.path.join(data_root, "smartphone_roi")
     if os.path.isdir(phone_dir):
         for subj_folder in sorted(os.listdir(phone_dir)):
@@ -355,13 +355,12 @@ def scan_xpalm(data_root):
                     continue
                 
                 hand = parts[1].lower()
-                variation = "_".join(parts[2:]).lower()
                 identity = f"XPALM_{subj_id}_{hand}"
                 
                 samples.append({
                     "path": os.path.join(subj_dir, fname),
                     "identity": identity,
-                    "spectrum": variation
+                    "spectrum": "smartphone"  # <-- Hardcoded domain
                 })
                 ids.add(identity)
 
