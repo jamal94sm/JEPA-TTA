@@ -225,6 +225,8 @@ def build_datasets(cfg):
     """
     if "xjtu" in cfg.data_dir.lower():
         all_samples = scan_xjtu(cfg.data_dir)
+    elif "xpalm" in cfg.data_dir.lower():
+        all_samples = scan_xpalm(cfg.data_dir)
     else:
         all_samples = scan_dataset(cfg.data_dir)
         
