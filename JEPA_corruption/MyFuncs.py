@@ -51,7 +51,7 @@ def _renorm(x, mean, std):
     std = x.new_tensor(std).view(1, -1, 1, 1)
     return (x - mean) / std
 
-
+'''
 def corrupt_visible_patches(images, context_masks, args):
     """
     For each visible patch, independently sample one of:
@@ -100,6 +100,161 @@ def corrupt_visible_patches(images, context_masks, args):
 
     x = x.reshape(B, 3, H, W)
     return _renorm(x, mean, std)
+'''
+
+
+import torchvision.transforms.functional as TF
+
+CORRUPTION_NAMES = [
+    "color_temp", "gamma", "channel_mix", "desaturate", "blur", "noise", "vignette",
+]
+
+
+def _severity(mask_1d, max_strength, device):
+    """Per-sample severity in [0, max_strength], only meaningful where mask_1d is True."""
+    return torch.rand(mask_1d.shape[0], 1, 1, 1, device=device) * max_strength
+
+
+def _apply_color_temp(xs, mask, max_strength):
+    # Simulates illuminant / spectral-band shift (e.g. CASIA WHT vs 940nm, or
+    # different device white-balance pipelines): push R up / B down or vice versa.
+    shift = (torch.rand(xs.size(0), 1, 1, 1, device=xs.device) * 2 - 1) * max_strength
+    r = (xs[:, 0:1] * (1 + shift)).clamp(0, 1)
+    b = (xs[:, 2:3] * (1 - shift)).clamp(0, 1)
+    out = torch.cat([r, xs[:, 1:2], b], dim=1)
+    return torch.where(mask.view(-1, 1, 1, 1), out, xs)
+
+
+def _apply_gamma(xs, mask, max_strength):
+    # Simulates sensor exposure / tone-curve differences across devices.
+    gamma = 1.0 + (torch.rand(xs.size(0), 1, 1, 1, device=xs.device) * 2 - 1) * max_strength
+    gamma = gamma.clamp(min=0.2)
+    out = xs.clamp(min=1e-3).pow(gamma)
+    return torch.where(mask.view(-1, 1, 1, 1), out, xs)
+
+
+def _apply_channel_mix(xs, mask, max_strength):
+    # Simulates spectral-response crosstalk between bands/sensors (e.g. multispectral
+    # NIR bands vs. RGB smartphone sensor having different channel sensitivities).
+    B = xs.size(0)
+    eye = torch.eye(3, device=xs.device).unsqueeze(0).expand(B, -1, -1)
+    off = (torch.rand(B, 3, 3, device=xs.device) * 2 - 1) * max_strength
+    M = eye + off
+    out = torch.einsum('bij,bjhw->bihw', M, xs).clamp(0, 1)
+    return torch.where(mask.view(-1, 1, 1, 1), out, xs)
+
+
+def _apply_desaturate(xs, mask, max_strength):
+    # Simulates spectrum change toward near-IR-like capture (low/no color information),
+    # relevant for CASIA's 850/940nm bands vs. WHT / XJTU's RGB captures.
+    alpha = torch.rand(xs.size(0), 1, 1, 1, device=xs.device) * max_strength
+    gray = xs.mean(dim=1, keepdim=True).expand_as(xs)
+    out = xs * (1 - alpha) + gray * alpha
+    return torch.where(mask.view(-1, 1, 1, 1), out, xs)
+
+
+def _apply_blur(xs, mask, max_sigma):
+    # Simulates device/optics resolution differences (e.g. fixed NIR camera vs.
+    # handheld smartphone focus/motion blur in XJTU-UP).
+    out = xs.clone()
+    idx = mask.nonzero(as_tuple=True)[0]
+    for i in idx.tolist():
+        sigma = float(torch.rand(1).item()) * max_sigma
+        if sigma < 0.05:
+            continue
+        k = max(3, int(2 * round(3 * sigma) + 1))
+        out[i:i+1] = TF.gaussian_blur(xs[i:i+1], kernel_size=k, sigma=sigma)
+    return out
+
+
+def _apply_noise(xs, mask, max_std):
+    # Sensor noise floor differences across devices.
+    std = torch.rand(xs.size(0), 1, 1, 1, device=xs.device) * max_std
+    out = (xs + std * torch.randn_like(xs)).clamp(0, 1)
+    return torch.where(mask.view(-1, 1, 1, 1), out, xs)
+
+
+def _apply_vignette(xs, mask, max_strength):
+    # Simulates acquisition-geometry / lens falloff differences (contact vs.
+    # contactless capture, different lens systems).
+    H, W = xs.shape[-2:]
+    yy, xx = torch.meshgrid(
+        torch.linspace(-1, 1, H, device=xs.device),
+        torch.linspace(-1, 1, W, device=xs.device),
+        indexing="ij",
+    )
+    r = torch.sqrt(xx ** 2 + yy ** 2)
+    strength = torch.rand(xs.size(0), 1, 1, 1, device=xs.device) * max_strength
+    falloff = 1.0 - strength * r.unsqueeze(0).unsqueeze(0).clamp(0, 1)
+    out = (xs * falloff).clamp(0, 1)
+    return torch.where(mask.view(-1, 1, 1, 1), out, xs)
+
+
+_CORRUPTION_FN = {
+    "color_temp":  lambda xs, m, args: _apply_color_temp(xs, m, args.color_temp_strength),
+    "gamma":       lambda xs, m, args: _apply_gamma(xs, m, args.gamma_strength),
+    "channel_mix": lambda xs, m, args: _apply_channel_mix(xs, m, args.channel_mix_strength),
+    "desaturate":  lambda xs, m, args: _apply_desaturate(xs, m, args.desaturate_strength),
+    "blur":        lambda xs, m, args: _apply_blur(xs, m, args.blur_sigma_max),
+    "noise":       lambda xs, m, args: _apply_noise(xs, m, args.corruption_std),
+    "vignette":    lambda xs, m, args: _apply_vignette(xs, m, args.vignette_strength),
+}
+
+
+def corrupt_visible_patches(images, context_masks, args):
+    """
+    Domain-shift-style corruption, applied UNIFORMLY across the whole image
+    (so every visible patch shares the same corruption) rather than per-patch.
+
+    - Which samples get corrupted at all: Bernoulli(args.corruption_prob) per sample
+      -> the number of corrupted samples per batch is itself random, controlled by
+         the corruption_prob hyperparameter.
+    - Which corruption(s) each corrupted sample gets:
+        args.corruption_mode == 'single' -> exactly one type, chosen uniformly.
+        args.corruption_mode == 'mixed'  -> each type included independently with
+                                             probability args.mix_prob (at least one
+                                             type is forced in so 'corrupted' is never a no-op).
+    - Severity of each applied corruption is randomized per-sample up to that
+      corruption's --*_strength / --corruption_std / --blur_sigma_max hyperparameter.
+    """
+    B = images.size(0)
+    device = images.device
+    mean, std = _norm_stats(args)
+    x = _denorm(images, mean, std)
+
+    corrupt_mask = torch.rand(B, device=device) < args.corruption_prob
+    if not corrupt_mask.any():
+        return images
+
+    n_types = len(CORRUPTION_NAMES)
+
+    if args.corruption_mode == "single":
+        chosen = torch.randint(0, n_types, (B,), device=device)
+        type_masks = {
+            name: corrupt_mask & (chosen == i)
+            for i, name in enumerate(CORRUPTION_NAMES)
+        }
+    else:  # mixed
+        include = torch.rand(B, n_types, device=device) < args.mix_prob
+        # Force at least one type per corrupted sample so it's never a silent no-op.
+        none_selected = ~include.any(dim=1)
+        if none_selected.any():
+            forced = torch.randint(0, n_types, (int(none_selected.sum()),), device=device)
+            include[none_selected, forced] = True
+        type_masks = {
+            name: corrupt_mask & include[:, i]
+            for i, name in enumerate(CORRUPTION_NAMES)
+        }
+
+    for name in CORRUPTION_NAMES:
+        m = type_masks[name]
+        if m.any():
+            x = _CORRUPTION_FN[name](x, m, args)
+
+    return _renorm(x, mean, std)
+
+
+###############################################
 
 
 def Train(
