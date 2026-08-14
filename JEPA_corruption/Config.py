@@ -46,4 +46,35 @@ def get_arguments():
     parser.add_argument('--weight_decay',              type=float, default=0.05)
     parser.add_argument('--final_weight_decay',        type=float, default=0.1)
 
+    # --- corruption gating ---
+    parser.add_argument('--corruption_prob',        type=float, default=0.5,
+                         help="Per-sample probability of being corrupted at all. "
+                              "Expected #corrupted per batch = corruption_prob * batch_size, "
+                              "actual count varies batch to batch (Bernoulli draw).")
+    parser.add_argument('--corruption_mode',        type=str,   default='mixed',
+                         choices=['single', 'mixed'],
+                         help="single: each corrupted sample gets exactly one corruption type. "
+                              "mixed: each corrupted sample gets a random subset of types.")
+    parser.add_argument('--mix_prob',                type=float, default=0.4,
+                         help="[mixed mode only] per-type inclusion probability. "
+                              "Each corrupted sample independently includes each corruption "
+                              "type with this probability (at least one is forced in).")
+    
+    # --- per-corruption severity (each is a *maximum*; actual severity for an "
+    #     applied" sample is drawn U(0, max) independently, so severity varies too) ---
+    parser.add_argument('--color_temp_strength',     type=float, default=0.25,   # illumination/white-balance shift
+                         help="Max R/B channel scale shift, simulates illuminant/spectrum change.")
+    parser.add_argument('--gamma_strength',          type=float, default=0.3,    # exposure/sensor response
+                         help="Max deviation of gamma exponent from 1.0.")
+    parser.add_argument('--channel_mix_strength',    type=float, default=0.15,   # spectral crosstalk
+                         help="Max off-diagonal magnitude of the random 3x3 channel-mix matrix.")
+    parser.add_argument('--desaturate_strength',     type=float, default=0.5,    # NIR-band spectrum change
+                         help="Max blend-toward-grayscale fraction.")
+    parser.add_argument('--blur_sigma_max',          type=float, default=1.5,    # device/resolution change
+                         help="Max Gaussian blur sigma (pixels).")
+    parser.add_argument('--corruption_std',          type=float, default=0.08,   # sensor noise (kept, renamed use)
+                         help="Max additive Gaussian noise std.")
+    parser.add_argument('--vignette_strength',       type=float, default=0.3,    # optics/acquisition geometry
+                         help="Max radial darkening at image corners.")
+
     return parser.parse_args()
