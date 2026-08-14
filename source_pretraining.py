@@ -44,7 +44,7 @@ from models import (ContextEncoder, TargetEncoder, Predictor,
                     repeat_interleave_batch, update_ema, CompNet, PlainViT, FeatModule)
 
 from evaluate import run_full_eval
-from corruptions import corrupt_images
+from corruption import corrupt_images
 
 CASIA_MEAN = [0.5, 0.5, 0.5]                    # NEW — matches dataset.py's Normalize()
 CASIA_STD  = [0.5, 0.5, 0.5]
