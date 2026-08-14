@@ -75,6 +75,21 @@ def get_cfg(args=None):
     # ─── Evaluation ───────────────────────────────────────────
     p.add_argument("--eval_every", type=int, default=10)
 
+    # ─── Domain-shift corruption (calibrated via calibrate_domain_gap.py) ──
+    p.add_argument("--use_corruption", type=int, default=1, choices=[0, 1],
+                   help="1 = apply domain-shift corruption to the JEPA context "
+                        "view during training; 0 = standard JEPA (no corruption).")
+    p.add_argument("--corruption_prob", type=float, default=0.5)
+    p.add_argument("--corruption_mode", default="single", choices=["single", "mixed"])
+    p.add_argument("--mix_prob", type=float, default=0.4)
+    p.add_argument("--color_temp_strength", type=float, default=0.2855)
+    p.add_argument("--gamma_strength", type=float, default=1.0)
+    p.add_argument("--channel_mix_strength", type=float, default=0.5)
+    p.add_argument("--desaturate_strength", type=float, default=1.0)
+    p.add_argument("--blur_sigma_max", type=float, default=2.1672)
+    p.add_argument("--corruption_std", type=float, default=0.0051)
+    p.add_argument("--vignette_strength", type=float, default=0.0319)
+
     # ─── Misc ─────────────────────────────────────────────────
     p.add_argument("--seed", type=int, default=2025)
     p.add_argument("--device", default="cuda")
