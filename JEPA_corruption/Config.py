@@ -19,8 +19,8 @@ def get_arguments():
     parser.add_argument('--num_blocks',                type=int,   default=1)
     parser.add_argument('--num_workers',               type=int,   default=2)
 
-    parser.add_argument('--epochs',                    type=int,   default=150)
-    parser.add_argument('--batch_size',                type=int,   default=1024)
+    #parser.add_argument('--epochs',                    type=int,   default=150)
+    #parser.add_argument('--batch_size',                type=int,   default=1024)
 
     parser.add_argument('--eval_only',                 type=int,   default=0,         choices=[0, 1])
     parser.add_argument('--eval_noise',                type=int,   default=0,         choices=[0, 1])
