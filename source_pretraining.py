@@ -44,6 +44,10 @@ from models import (ContextEncoder, TargetEncoder, Predictor,
                     repeat_interleave_batch, update_ema, CompNet, PlainViT, FeatModule)
 
 from evaluate import run_full_eval
+from corruptions import corrupt_images
+
+CASIA_MEAN = [0.5, 0.5, 0.5]                    # NEW — matches dataset.py's Normalize()
+CASIA_STD  = [0.5, 0.5, 0.5]
 
 
 def set_seed(seed):
@@ -142,7 +146,7 @@ def train_jepa(cfg, train_loader, eval_dict, id_map, n_classes):
         ep_var = 0.0
         n_bat = 0
         t0 = time.time()
-
+        
         for images, _ in train_loader:
             images = images.to(cfg.device)
             B = images.size(0)
@@ -153,7 +157,11 @@ def train_jepa(cfg, train_loader, eval_dict, id_map, n_classes):
                 ctx_ratio=tuple(cfg.ctx_ratio),
                 device=cfg.device)
 
-            ctx_embeds = context_encoder(images, ctx_masks)
+            if cfg.use_corruption:                                          # NEW
+                images_ctx = corrupt_images(images, cfg, CASIA_MEAN, CASIA_STD)  # NEW
+            else:                                                           # NEW
+                images_ctx = images                                         # NEW
+            ctx_embeds = context_encoder(images_ctx, ctx_masks)              # CHANGED (was: context_encoder(images, ctx_masks))
 
             with torch.no_grad():
                 z_flat = ctx_embeds.reshape(-1, ctx_embeds.size(-1))
