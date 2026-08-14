@@ -19,8 +19,8 @@ def get_arguments():
     parser.add_argument('--num_blocks',                type=int,   default=1)
     parser.add_argument('--num_workers',               type=int,   default=2)
 
-    #parser.add_argument('--epochs',                    type=int,   default=150)
-    #parser.add_argument('--batch_size',                type=int,   default=1024)
+    parser.add_argument('--epochs',                    type=int,   default=150)
+    parser.add_argument('--batch_size',                type=int,   default=1024)
 
     parser.add_argument('--eval_only',                 type=int,   default=0,         choices=[0, 1])
     parser.add_argument('--eval_noise',                type=int,   default=0,         choices=[0, 1])
@@ -36,8 +36,8 @@ def get_arguments():
 
     # Visible-patch corruptions (one type drawn uniformly per visible patch):
     # blue, red, green, jitter, noise. Targets stay clean. Loss = MSE(z_p, z_2).
-    parser.add_argument('--corruption_std',            type=float, default=0.1)
-    parser.add_argument('--jitter_strength',           type=float, default=0.4)
+    #parser.add_argument('--corruption_std',            type=float, default=0.1)
+    #parser.add_argument('--jitter_strength',           type=float, default=0.4)
 
     parser.add_argument('--learning_rate',             type=float, default=3e-4)
     parser.add_argument('--start_lr',                  type=float, default=1e-6)
