@@ -90,6 +90,15 @@ def get_cfg(args=None):
     p.add_argument("--corruption_std", type=float, default=0.01)
     p.add_argument("--vignette_strength", type=float, default=0.05)
 
+    # ─── Gabor structural auxiliary loss (A1) ─────────────────
+    p.add_argument("--use_gabor", type=int, default=1, choices=[0, 1],
+                   help="1 = add Gabor line-structure auxiliary loss to JEPA.")
+    p.add_argument("--gabor_weight", type=float, default=0.3)
+    p.add_argument("--gabor_orient", type=int, default=8)
+    p.add_argument("--gabor_log_every", type=int, default=5,
+                   help="Print Gabor diagnostics every N epochs.")
+
+    
     # ─── Misc ─────────────────────────────────────────────────
     p.add_argument("--seed", type=int, default=2025)
     p.add_argument("--device", default="cuda")
