@@ -3,12 +3,18 @@ source_pretraining.py — Source-model pretraining with a method toggle.
 
   --method jepa     : transformer + self-supervised (I-JEPA)   [original path]
   --method compnet  : CompNet CNN + supervised cross-entropy on training IDs
+  --method vit_sup  : plain ViT + supervised cross-entropy on training IDs
 
 Both paths share the same dataset pipeline and the same evaluation
 (run_full_eval on the eval_dict), and both save a checkpoint whose backbone
 produces [B, embed_dim] features — so all downstream subspace tooling works
 unchanged. Point --output_dir somewhere method-specific so checkpoints do not
 collide (e.g. ./output_jepa vs ./output_compnet).
+
+JEPA add-ons (both default OFF, so --use_corruption 0 --use_gabor 0 reproduces
+the original baseline exactly):
+  --use_corruption 1 : domain-shift corruption applied to the CONTEXT view only
+  --use_gabor 1      : Gabor line-structure auxiliary loss (design A1)
 
 
 python source_pretraining.py --method compnet --data_dir /home/pai-ng/Jamal/CASIA-MS-ROI --mode cross_domain_openset --train_spectrums WHT --output_dir ./output_compnet
@@ -20,11 +26,11 @@ nohup python source_pretraining.py --method vit_sup \
   --patch_size 14 --vit_depth 6 --vit_heads 8 \
   --output_dir ./output_vitsup > SupViT.log 2>&1 &
 
-nohup python source_pretraining.py --method vit_sup \
-  --data_dir /home/pai-ng/Jamal/XJTU-UP \
-  --mode cross_domain_openset --train_spectrums iPhone_Nature \
-  --patch_size 14 --vit_depth 6 --vit_heads 8 \
-  --output_dir ./output_vitsup_xjtu > SupViT.log 2>&1 &
+nohup python source_pretraining.py --method jepa \
+  --data_dir /home/pai-ng/Jamal/CASIA-MS-ROI \
+  --mode cross_domain_openset --train_spectrums WHT \
+  --use_gabor 1 --gabor_weight 0.3 \
+  --output_dir ./output_jepa_gabor > JepaGabor.log 2>&1 &
 
 """
 
@@ -41,12 +47,14 @@ from config import get_cfg
 from dataset import build_datasets
 from models import (ContextEncoder, TargetEncoder, Predictor,
                     FeatureExtractor, patchify, apply_masks,
-                    repeat_interleave_batch, update_ema, CompNet, PlainViT, FeatModule)
+                    repeat_interleave_batch, update_ema, CompNet, PlainViT,
+                    FeatModule, GaborHead)
 
 from evaluate import run_full_eval
 from corruption import corrupt_images
+from gabor import GaborBank, patch_energy_descriptor, sanity_report
 
-CASIA_MEAN = [0.5, 0.5, 0.5]                    # NEW — matches dataset.py's Normalize()
+CASIA_MEAN = [0.5, 0.5, 0.5]                    # matches dataset.py's Normalize()
 CASIA_STD  = [0.5, 0.5, 0.5]
 
 
@@ -57,20 +65,20 @@ def set_seed(seed):
     torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
 
+
 def ckpt_name(cfg):
     """ckpt_{dataset}_{method}_{source_domain}.pth"""
     dataset = os.path.basename(os.path.normpath(cfg.data_dir)).lower()
-    
+
     if "casia" in dataset:
         dataset = "casiams"
     elif "xjtu" in dataset:
         dataset = "xjtu"
     elif "xpalm" in dataset:
         dataset = "xpalm"
-        
+
     domain = "-".join(cfg.train_spectrums) if cfg.train_spectrums else "all"
     return f"ckpt_{dataset}_{cfg.method}_{domain}.pth"
-  
 
 
 # ══════════════════════════════════════════════════════════════
@@ -93,7 +101,7 @@ def make_scheduler(opt, cfg, total_steps):
 
 
 # ══════════════════════════════════════════════════════════════
-#  JEPA (self-supervised) — original training path, unchanged
+#  JEPA (self-supervised)
 # ══════════════════════════════════════════════════════════════
 
 def train_jepa(cfg, train_loader, eval_dict, id_map, n_classes):
@@ -118,9 +126,29 @@ def train_jepa(cfg, train_loader, eval_dict, id_map, n_classes):
     print(f"  Context encoder: {n_ctx/1e6:.2f}M params")
     print(f"  Predictor: {n_pred/1e6:.2f}M params")
 
-    opt = torch.optim.AdamW(
-        list(context_encoder.parameters()) + list(predictor.parameters()),
-        lr=cfg.learning_rate, weight_decay=cfg.weight_decay)
+    # ─── Gabor structural auxiliary head (design A1) ──────────
+    use_gabor = bool(getattr(cfg, "use_gabor", 0)) and \
+                float(getattr(cfg, "gabor_weight", 0.0)) > 0.0
+    gabor_bank = gabor_head = None
+    if use_gabor:
+        gabor_bank = GaborBank(n_orient=cfg.gabor_orient).to(cfg.device)
+        gabor_head = GaborHead(cfg.embed_dim, gabor_bank.K).to(cfg.device)
+        n_gab = sum(p.numel() for p in gabor_head.parameters())
+        print(f"  Gabor bank: K={gabor_bank.K} channels "
+              f"({cfg.gabor_orient} orient x {gabor_bank.n_scales} scales), "
+              f"trainable={gabor_bank.weight.requires_grad}")
+        print(f"  Gabor head: {n_gab/1e6:.3f}M params   "
+              f"weight={cfg.gabor_weight}")
+
+    print(f"  Corruption: {'ON' if getattr(cfg, 'use_corruption', 0) else 'OFF'}"
+          f"   Gabor aux: {'ON' if use_gabor else 'OFF'}")
+
+    train_params = list(context_encoder.parameters()) + list(predictor.parameters())
+    if use_gabor:
+        train_params += list(gabor_head.parameters())
+    opt = torch.optim.AdamW(train_params, lr=cfg.learning_rate,
+                            weight_decay=cfg.weight_decay)
+
     total_steps = cfg.epochs * len(train_loader)
     scheduler = make_scheduler(opt, cfg, total_steps)
 
@@ -141,12 +169,17 @@ def train_jepa(cfg, train_loader, eval_dict, id_map, n_classes):
         context_encoder.train()
         predictor.train()
         target_encoder.eval()
+        if use_gabor:
+            gabor_head.train()
 
-        ep_loss = 0.0
+        ep_loss = 0.0          # raw JEPA term only — comparable across runs
         ep_var = 0.0
+        ep_gab = 0.0           # Gabor auxiliary loss
+        ep_gcos = 0.0          # cosine(pred, target) for the Gabor branch
+        ep_gpvar = 0.0         # variance of Gabor head outputs (collapse check)
         n_bat = 0
         t0 = time.time()
-        
+
         for images, _ in train_loader:
             images = images.to(cfg.device)
             B = images.size(0)
@@ -157,11 +190,11 @@ def train_jepa(cfg, train_loader, eval_dict, id_map, n_classes):
                 ctx_ratio=tuple(cfg.ctx_ratio),
                 device=cfg.device)
 
-            if cfg.use_corruption:                                          # NEW
-                images_ctx = corrupt_images(images, cfg, CASIA_MEAN, CASIA_STD)  # NEW
-            else:                                                           # NEW
-                images_ctx = images                                         # NEW
-            ctx_embeds = context_encoder(images_ctx, ctx_masks)              # CHANGED (was: context_encoder(images, ctx_masks))
+            if cfg.use_corruption:
+                images_ctx = corrupt_images(images, cfg, CASIA_MEAN, CASIA_STD)
+            else:
+                images_ctx = images
+            ctx_embeds = context_encoder(images_ctx, ctx_masks)
 
             with torch.no_grad():
                 z_flat = ctx_embeds.reshape(-1, ctx_embeds.size(-1))
@@ -175,7 +208,47 @@ def train_jepa(cfg, train_loader, eval_dict, id_map, n_classes):
 
             pred_embeds = predictor(ctx_embeds, ctx_masks, tgt_masks)
 
-            loss = F.smooth_l1_loss(pred_embeds, tgt_embeds)
+            loss_jepa = F.smooth_l1_loss(pred_embeds, tgt_embeds)
+            loss = loss_jepa
+
+            # ─── Gabor auxiliary (A1): visible patches, clean-image target ───
+            if use_gabor:
+                with torch.no_grad():
+                    desc = patch_energy_descriptor(
+                        gabor_bank(images), cfg.num_patches)     # CLEAN image
+                    g_tgt = apply_masks(desc, ctx_masks)         # CONTEXT masks
+
+                if epoch == 1 and n_bat == 0:
+                    assert g_tgt.shape[:2] == ctx_embeds.shape[:2], (
+                        f"Gabor/context mask misalignment: "
+                        f"g_tgt {tuple(g_tgt.shape)} vs "
+                        f"ctx_embeds {tuple(ctx_embeds.shape)}")
+                    rep = sanity_report(gabor_bank, images, cfg.num_patches)
+                    print("\n  ── Gabor sanity check (epoch 1, batch 0) ──")
+                    for k, v in rep.items():
+                        print(f"      {k}: {v}")
+                    print(f"      ctx_embeds: {tuple(ctx_embeds.shape)}   "
+                          f"g_tgt: {tuple(g_tgt.shape)}")
+                    if rep["desc_pair_cos"] > 0.95:
+                        print("      !! WARNING: descriptors nearly identical "
+                              "across patches — target carries little signal.")
+                    if not (0.99 < rep["desc_norm_mean"] < 1.01):
+                        print("      !! WARNING: descriptor norms != 1.0 "
+                              "— normalization broken.")
+                    if rep["resp_absmean"] < 1e-6:
+                        print("      !! WARNING: Gabor responses ~0 "
+                              "— filter construction bug.")
+                    print()
+
+                g_pred = F.normalize(gabor_head(ctx_embeds), dim=-1)
+                g_cos = F.cosine_similarity(g_pred, g_tgt, dim=-1)
+                l_gab = (1.0 - g_cos).mean()
+                loss = loss + cfg.gabor_weight * l_gab
+
+                ep_gab += l_gab.item()
+                ep_gcos += g_cos.mean().item()
+                ep_gpvar += g_pred.reshape(
+                    -1, g_pred.size(-1)).var(dim=0).mean().item()
 
             opt.zero_grad()
             loss.backward()
@@ -186,11 +259,14 @@ def train_jepa(cfg, train_loader, eval_dict, id_map, n_classes):
             update_ema(context_encoder, target_encoder, momentum)
 
             global_step += 1
-            ep_loss += loss.item()
+            ep_loss += loss_jepa.item()
             n_bat += 1
 
         ep_loss /= max(n_bat, 1)
         ep_var /= max(n_bat, 1)
+        ep_gab /= max(n_bat, 1)
+        ep_gcos /= max(n_bat, 1)
+        ep_gpvar /= max(n_bat, 1)
         elapsed = time.time() - t0
         lr_now = scheduler.get_last_lr()[0]
 
@@ -205,6 +281,25 @@ def train_jepa(cfg, train_loader, eval_dict, id_map, n_classes):
                   f"loss={ep_loss:.4f}  sim={sim:.3f}  "
                   f"var={ep_var:.4f}  lr={lr_now:.2e}  "
                   f"mom={momentum:.4f}  [{elapsed:.1f}s]")
+            if use_gabor:
+                print(f"           gabor: l_gab={ep_gab:.4f}  "
+                      f"cos={ep_gcos:.3f}  pred_var={ep_gpvar:.5f}")
+
+        # Gradient-norm diagnostic: grads from the final batch are still live
+        # here (zero_grad happens at the start of the next iteration).
+        if use_gabor and (epoch % cfg.gabor_log_every == 0 or epoch == 1):
+            with torch.no_grad():
+                head_gnorm = sum(
+                    p.grad.norm().item() ** 2
+                    for p in gabor_head.parameters()
+                    if p.grad is not None) ** 0.5
+                enc_gnorm = sum(
+                    p.grad.norm().item() ** 2
+                    for p in context_encoder.parameters()
+                    if p.grad is not None) ** 0.5
+            ratio = head_gnorm / max(enc_gnorm, 1e-12)
+            print(f"           grad norms: gabor_head={head_gnorm:.4f}  "
+                  f"context_encoder={enc_gnorm:.4f}  ratio={ratio:.2f}")
 
         if epoch % cfg.eval_every == 0 or epoch == cfg.epochs:
             print(f"\n  ── Eval at epoch {epoch} ──")
@@ -214,6 +309,9 @@ def train_jepa(cfg, train_loader, eval_dict, id_map, n_classes):
                 tag=f"[ep{epoch}] ")
 
             eval_entry = {"epoch": epoch, "loss": ep_loss, "sim": sim}
+            if use_gabor:
+                eval_entry["l_gab"] = ep_gab
+                eval_entry["gabor_cos"] = ep_gcos
             mean_r1 = np.mean([r["rank1"] for r in eval_results.values()])
             mean_eer = np.mean([r["eer"] for r in eval_results.values()])
             eval_entry["mean_rank1"] = mean_r1
@@ -226,7 +324,7 @@ def train_jepa(cfg, train_loader, eval_dict, id_map, n_classes):
                 best_eval = {"epoch": epoch, "mean_rank1": mean_r1,
                              "mean_eer": mean_eer}
                 ckpt_path = os.path.join(cfg.output_dir, ckpt_name(cfg))
-                torch.save({
+                ckpt = {
                     "epoch": epoch,
                     "method": "jepa",
                     "context_encoder": context_encoder.state_dict(),
@@ -236,14 +334,20 @@ def train_jepa(cfg, train_loader, eval_dict, id_map, n_classes):
                              "num_patches": cfg.num_patches,
                              "img_size": cfg.img_size},
                     "mean_rank1": mean_r1,
-                }, ckpt_path)
+                }
+                if use_gabor:
+                    ckpt["gabor_head"] = gabor_head.state_dict()
+                    ckpt["gabor_cfg"] = {"orient": cfg.gabor_orient,
+                                         "K": gabor_bank.K,
+                                         "weight": cfg.gabor_weight}
+                torch.save(ckpt, ckpt_path)
                 print(f"    ★ New best R1={mean_r1:.2f}% "
                       f"EER={mean_eer:.2f}% → saved")
 
             print(f"    Summary: Mean R1={mean_r1:.2f}% | "
                   f"Mean EER={mean_eer:.2f}%\n")
 
-    _print_history_jepa(eval_history, eval_dict)
+    _print_history_jepa(eval_history, eval_dict, use_gabor)
     _print_footer(cfg, best_eval)
 
     save_path = os.path.join(cfg.output_dir,
@@ -257,6 +361,10 @@ def train_jepa(cfg, train_loader, eval_dict, id_map, n_classes):
                 "epochs": cfg.epochs,
                 "train_spectrums": cfg.train_spectrums,
                 "aug_multiplier": cfg.aug_multiplier,
+                "use_corruption": int(getattr(cfg, "use_corruption", 0)),
+                "use_gabor": int(use_gabor),
+                "gabor_weight": float(getattr(cfg, "gabor_weight", 0.0)),
+                "gabor_orient": int(getattr(cfg, "gabor_orient", 0)),
             },
             "best": best_eval, "history": eval_history,
         }, f, indent=2)
@@ -350,8 +458,8 @@ def train_compnet(cfg, train_loader, eval_dict, id_map, n_train_ids, train_id_ma
                     "arch": {"embed_dim": cfg.embed_dim,
                              "compnet_channels": cfg.compnet_channels,
                              "img_size": cfg.img_size},
-                    "train_id_map": train_id_map,        # ← identity str -> class idx
-                    "n_train_ids": n_train_ids,          # ← convenient, redundant but explicit
+                    "train_id_map": train_id_map,        # identity str -> class idx
+                    "n_train_ids": n_train_ids,
                     "mean_rank1": mean_r1, "mean_eer": mean_eer,
                 }, ckpt_path)
                 print(f"    ★ New best EER={mean_eer:.2f}% "
@@ -378,7 +486,6 @@ def train_compnet(cfg, train_loader, eval_dict, id_map, n_train_ids, train_id_ma
             "best": best_eval, "history": eval_history,
         }, f, indent=2)
     print(f"\n  Saved: {save_path}")
-
 
 
 # ══════════════════════════════════════════════════════════════
@@ -506,19 +613,27 @@ def train_vit_sup(cfg, train_loader, eval_dict, id_map, n_train_ids, train_id_ma
 #  History / footer printers
 # ══════════════════════════════════════════════════════════════
 
-def _print_history_jepa(eval_history, eval_dict):
+def _print_history_jepa(eval_history, eval_dict, use_gabor=False):
     eval_names = list(eval_dict.keys())
-    print(f"\n  {'Epoch':>6} {'Loss':>8} {'Sim':>6}", end="")
+    if use_gabor:
+        print(f"\n  {'Epoch':>6} {'Loss':>8} {'Sim':>6} {'l_gab':>7} {'gcos':>6}", end="")
+    else:
+        print(f"\n  {'Epoch':>6} {'Loss':>8} {'Sim':>6}", end="")
     for name in eval_names:
         print(f" │ {name[:12]:>12} R1   EER", end="")
     print()
     print(f"  {'─'*8}{'─'*8}{'─'*6}", end="")
+    if use_gabor:
+        print(f"{'─'*7}{'─'*6}", end="")
     for _ in eval_names:
         print(f"─┼─{'─'*24}", end="")
     print()
     for entry in eval_history:
         print(f"  {entry['epoch']:>6} {entry['loss']:>8.4f} "
               f"{entry['sim']:>6.3f}", end="")
+        if use_gabor:
+            print(f" {entry.get('l_gab', float('nan')):>7.4f} "
+                  f"{entry.get('gabor_cos', float('nan')):>6.3f}", end="")
         for name in eval_names:
             if name in entry:
                 r = entry[name]
