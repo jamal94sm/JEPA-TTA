@@ -9,6 +9,23 @@ import numpy as np
 import math
 
 
+
+class GaborHead(nn.Module):
+    """Maps context embeddings -> per-patch Gabor descriptors."""
+
+    def __init__(self, embed_dim, out_dim, hidden=None):
+        super().__init__()
+        hidden = hidden or embed_dim
+        self.net = nn.Sequential(
+            nn.Linear(embed_dim, hidden),
+            nn.GELU(),
+            nn.Linear(hidden, out_dim),
+        )
+
+    def forward(self, z):
+        return self.net(z)
+
+
 def get_1d_sincos_pos_embed(embed_dim, pos):
     omega = np.arange(embed_dim // 2, dtype=float)
     omega /= embed_dim / 2.
