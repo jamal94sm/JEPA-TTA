@@ -9,9 +9,13 @@ import numpy as np
 import math
 
 
+class StructureHead(nn.Module):
+    """Maps embeddings (embed_dim) -> Gabor descriptor space (out_dim).
 
-class GaborHead(nn.Module):
-    """Maps context embeddings -> per-patch Gabor descriptors."""
+    Shared between A1 (fed ctx_embeds) and A2 (fed the predictor's structure
+    output, which is projected back to embed_dim). Sharing forces both paths
+    into a consistent structural space.
+    """
 
     def __init__(self, embed_dim, out_dim, hidden=None):
         super().__init__()
@@ -24,6 +28,32 @@ class GaborHead(nn.Module):
 
     def forward(self, z):
         return self.net(z)
+
+
+# Backward-compatible alias for existing imports.
+GaborHead = StructureHead
+
+
+class UncertaintyWeighting(nn.Module):
+    """Kendall et al. homoscedastic task weighting.
+
+    total = sum_i [ 0.5 * exp(-log_var_i) * L_i + 0.5 * log_var_i ]
+    """
+
+    def __init__(self, n_tasks):
+        super().__init__()
+        self.log_var = nn.Parameter(torch.zeros(n_tasks))
+
+    def forward(self, losses):
+        total = 0.0
+        for i, l in enumerate(losses):
+            total = total + 0.5 * torch.exp(-self.log_var[i]) * l \
+                    + 0.5 * self.log_var[i]
+        return total
+
+    def weights(self):
+        with torch.no_grad():
+            return [0.5 * float(torch.exp(-v)) for v in self.log_var]
 
 
 def get_1d_sincos_pos_embed(embed_dim, pos):
@@ -52,8 +82,6 @@ def _gather(x, mask):
     return torch.gather(x, dim=1, index=idx)
 
 
-
-
 class SupervisedViT(nn.Module):
     """JEPA's ViT encoder + a linear head, for supervised CE pretraining.
        backbone(x) -> [B, embed_dim]  (same contract as CompNetBackbone),
@@ -67,7 +95,6 @@ class SupervisedViT(nn.Module):
     def forward(self, x):
         feat = self.backbone(x)
         return self.classifier(feat), feat
-
 
 
 class PlainViT(nn.Module):
@@ -215,6 +242,19 @@ class TargetEncoder(nn.Module):
 # ══════════════════════════════════════════════════════════════
 
 class Predictor(nn.Module):
+    """Shared predictor with task tokens.
+
+    forward(..., predict_structure=False) -> appearance preds  [B*, N_tgt, embed_dim]
+    forward(..., predict_structure=True)  -> (appearance, structure), both
+                                             [B*, N_tgt, embed_dim]
+
+    Task token 0 = appearance (JEPA target space).
+    Task token 1 = structure  (Gabor descriptor space, via out_proj_struct).
+    Both query the SAME target positions in one forward pass, so the shared
+    trunk learns spatial extrapolation once and only the output projection
+    differs per task.
+    """
+
     def __init__(self, num_patches, embed_dim, pred_dim=None, depth=None):
         super().__init__()
         if pred_dim is None:
@@ -228,7 +268,12 @@ class Predictor(nn.Module):
 
         self.in_proj = nn.Linear(embed_dim, pred_dim)
         self.out_proj = nn.Linear(pred_dim, embed_dim)
+        self.out_proj_struct = nn.Linear(pred_dim, embed_dim)
         self.mask_token = nn.Parameter(torch.zeros(1, 1, pred_dim))
+
+        # [0] = appearance, [1] = structure
+        self.task_embed = nn.Parameter(torch.zeros(2, 1, 1, pred_dim))
+        nn.init.trunc_normal_(self.task_embed, std=0.02)
 
         pos = get_2d_sincos_pos_embed(pred_dim, num_patches)
         self.pos_embed = nn.Parameter(
@@ -241,7 +286,8 @@ class Predictor(nn.Module):
         self.encoder = nn.TransformerEncoder(enc, depth)
         self.norm = nn.LayerNorm(pred_dim)
 
-    def forward(self, context, context_masks, target_masks):
+    def forward(self, context, context_masks, target_masks,
+                predict_structure=False):
         if not isinstance(context_masks, list):
             context_masks = [context_masks]
         if not isinstance(target_masks, list):
@@ -261,16 +307,28 @@ class Predictor(nn.Module):
 
         pos_tgt = torch.cat(
             [_gather(pos_full, m) for m in target_masks], dim=0)
-        mask_tokens = self.mask_token.expand(
+
+        base_tokens = self.mask_token.expand(
             pos_tgt.size(0), N_tgt, -1) + pos_tgt
+        mask_appear = base_tokens + self.task_embed[0]
 
         x = x.repeat(n_tgt, 1, 1)
-        x = torch.cat([x, mask_tokens], dim=1)
+
+        if predict_structure:
+            mask_struct = base_tokens + self.task_embed[1]
+            x = torch.cat([x, mask_appear, mask_struct], dim=1)
+        else:
+            x = torch.cat([x, mask_appear], dim=1)
+
         x = self.encoder(x)
         x = self.norm(x)
 
-        preds = x[:, -N_tgt:]
-        return self.out_proj(preds)
+        if predict_structure:
+            appear = self.out_proj(x[:, -2 * N_tgt:-N_tgt])
+            struct = self.out_proj_struct(x[:, -N_tgt:])
+            return appear, struct
+
+        return self.out_proj(x[:, -N_tgt:])
 
 
 # ══════════════════════════════════════════════════════════════
@@ -368,7 +426,6 @@ def update_ema(context_encoder, target_encoder, momentum):
     for pc, pt in zip(context_encoder.parameters(),
                       target_encoder.parameters()):
         pt.data.mul_(momentum).add_(pc.data * (1.0 - momentum))
-
 
 
 # ══════════════════════════════════════════════════════════════
