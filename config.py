@@ -8,11 +8,11 @@ def get_cfg(args=None):
     p = argparse.ArgumentParser(description="JEPA on CASIA-MS")
 
     # ─── Dataset ──────────────────────────────────────────────
-    
+
     #"data_root"        : "/home/pai-ng/Jamal/CASIA-MS-ROI",
     #"xjtu_data_root"   : "/home/pai-ng/Jamal/XJTU-UP",
     #"xpalm_data_root"  : "/home/pai-ng/Jamal/xpalm",
-    
+
     p.add_argument("--data_dir", required=True, default = "/home/pai-ng/Jamal/CASIA-MS-ROI")
     p.add_argument("--img_size", type=int, default=112)
 
@@ -40,7 +40,7 @@ def get_cfg(args=None):
     p.add_argument("--compnet_channels", type=int, default=16,
                    help="base channel width of the Gabor/competition block")
     p.add_argument("--label_smoothing", type=float, default=0.0)
-    
+
     # ─── JEPA architecture ────────────────────────────────────
     p.add_argument("--embed_dim", type=int, default=256)
     p.add_argument("--num_patches", type=int, default=8,
@@ -51,14 +51,14 @@ def get_cfg(args=None):
                    default=[0.10, 0.15])
     p.add_argument("--ctx_ratio", type=float, nargs=2,
                    default=[0.90, 1.00])
-    
+
     ### Custom ViT for supervised pretraining
     p.add_argument("--patch_size", type=int, default=14,
                    help="ViT patch size; img_size must be divisible by it "
                         "(112/14 = 8x8 = 64 patches)")
     p.add_argument("--vit_depth", type=int, default=6)
     p.add_argument("--vit_heads", type=int, default=8)
-    
+
     # ─── Training ─────────────────────────────────────────────
     p.add_argument("--epochs", type=int, default=200)
     p.add_argument("--batch_size", type=int, default=64)
@@ -90,24 +90,28 @@ def get_cfg(args=None):
     p.add_argument("--corruption_std", type=float, default=0.01)
     p.add_argument("--vignette_strength", type=float, default=0.05)
 
-    # ─── Gabor structural auxiliary loss (A1) ─────────────────
-    p.add_argument("--use_gabor", type=int, default=1, choices=[0, 1],
-                   help="1 = add Gabor line-structure auxiliary loss to JEPA.")
-    p.add_argument("--gabor_weight", type=float, default=0.3)
+    # ─── Gabor filter bank (shared by A1 and A2) ──────────────
     p.add_argument("--gabor_orient", type=int, default=8)
-    p.add_argument("--gabor_log_every", type=int, default=5,
-                   help="Print Gabor diagnostics every N epochs.")
-    p.add_argument("--gabor_schedule", default="constant",
-                   choices=["constant", "decay", "ramp", "cosine"],
-                   help="constant: fixed weight. decay: w -> w_final over "
-                        "schedule_end. ramp: 0 -> w over schedule_end. "
-                        "cosine: w -> w_final over full training.")
-    p.add_argument("--gabor_weight_final", type=float, default=0.0)
-    p.add_argument("--gabor_schedule_end", type=float, default=0.25,
-                   help="Fraction of total epochs the ramp/decay spans.")
     p.add_argument("--gabor_gray", type=int, default=1, choices=[0, 1],
                    help="1 = collapse to grayscale (correct for CASIA). "
                         "0 = per-channel Gabor (RGB datasets, e.g. XJTU).")
+    p.add_argument("--gabor_log_every", type=int, default=5,
+                   help="Print structural/diagnostic logs every N epochs.")
+
+    # ─── Legacy A1 aliases (deprecated; prefer --struct_mode) ──
+    p.add_argument("--use_gabor", type=int, default=0, choices=[0, 1],
+                   help="DEPRECATED alias for --struct_mode a1. "
+                        "Prefer --struct_mode.")
+    p.add_argument("--gabor_weight", type=float, default=0.3,
+                   help="DEPRECATED alias for --w_a1 (only read when "
+                        "--use_gabor 1 resolves struct_mode to 'a1').")
+    p.add_argument("--gabor_schedule", default="constant",
+                   choices=["constant", "decay", "ramp", "cosine"],
+                   help="Only applies to the legacy --use_gabor path. "
+                        "Decay was shown to underperform constant.")
+    p.add_argument("--gabor_weight_final", type=float, default=0.0)
+    p.add_argument("--gabor_schedule_end", type=float, default=0.25,
+                   help="Fraction of total epochs the ramp/decay spans.")
 
     # ─── Structural task selection (A1 / A2) ──────────────────
     p.add_argument("--struct_mode", default="none",
@@ -132,10 +136,20 @@ def get_cfg(args=None):
     # ─── Diagnostics ──────────────────────────────────────────
     p.add_argument("--log_conflict", type=int, default=1, choices=[0, 1],
                    help="Log cosine between task gradients on shared params.")
-    
+
     # ─── Misc ─────────────────────────────────────────────────
     p.add_argument("--seed", type=int, default=2025)
     p.add_argument("--device", default="cuda")
     p.add_argument("--output_dir", default="./output_jepa")
 
-    return p.parse_args(args)
+    cfg = p.parse_args(args)
+
+    # ─── Resolve legacy --use_gabor into --struct_mode ────────
+    # --use_gabor 1 (with struct_mode left at "none") == --struct_mode a1,
+    # so existing A1 command lines keep working unchanged.
+    if cfg.struct_mode == "none" and int(cfg.use_gabor) == 1:
+        cfg.struct_mode = "a1"
+        cfg.w_a1 = cfg.gabor_weight
+    cfg.use_a1 = cfg.struct_mode in ("a1", "both")
+    cfg.use_a2 = cfg.struct_mode in ("a2", "both")
+    return cfg
