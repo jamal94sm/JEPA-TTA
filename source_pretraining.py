@@ -58,6 +58,27 @@ CASIA_MEAN = [0.5, 0.5, 0.5]                    # matches dataset.py's Normalize
 CASIA_STD  = [0.5, 0.5, 0.5]
 
 
+def gabor_weight_at(epoch, cfg):
+    """Auxiliary-loss weight for this epoch (1-indexed)."""
+    w0 = float(cfg.gabor_weight)
+    wf = float(getattr(cfg, "gabor_weight_final", 0.0))
+    s = getattr(cfg, "gabor_schedule", "constant")
+
+    if s == "constant":
+        return w0
+    if s == "cosine":
+        p = (epoch - 1) / max(1, cfg.epochs - 1)
+        return wf + (w0 - wf) * 0.5 * (1 + math.cos(math.pi * p))
+
+    T = max(1, int(cfg.gabor_schedule_end * cfg.epochs))
+    t = min(1.0, (epoch - 1) / T)
+    if s == "decay":
+        return w0 + (wf - w0) * t
+    if s == "ramp":
+        return w0 * t
+    raise ValueError(f"unknown gabor_schedule: {s}")
+  
+
 def set_seed(seed):
     random.seed(seed)
     np.random.seed(seed)
@@ -131,14 +152,21 @@ def train_jepa(cfg, train_loader, eval_dict, id_map, n_classes):
                 float(getattr(cfg, "gabor_weight", 0.0)) > 0.0
     gabor_bank = gabor_head = None
     if use_gabor:
-        gabor_bank = GaborBank(n_orient=cfg.gabor_orient).to(cfg.device)
+        gabor_bank = GaborBank(
+            n_orient=cfg.gabor_orient,
+            per_channel=not bool(getattr(cfg, "gabor_gray", 1)),
+        ).to(cfg.device)
         gabor_head = GaborHead(cfg.embed_dim, gabor_bank.K).to(cfg.device)
         n_gab = sum(p.numel() for p in gabor_head.parameters())
+        mode = "per-channel RGB" if gabor_bank.per_channel else "grayscale"
         print(f"  Gabor bank: K={gabor_bank.K} channels "
-              f"({cfg.gabor_orient} orient x {gabor_bank.n_scales} scales), "
+              f"({cfg.gabor_orient} orient x {gabor_bank.n_scales} scales, {mode}), "
               f"trainable={gabor_bank.weight.requires_grad}")
         print(f"  Gabor head: {n_gab/1e6:.3f}M params   "
-              f"weight={cfg.gabor_weight}")
+              f"schedule={getattr(cfg, 'gabor_schedule', 'constant')}  "
+              f"w0={cfg.gabor_weight} -> wf={getattr(cfg, 'gabor_weight_final', 0.0)}  "
+              f"end={getattr(cfg, 'gabor_schedule_end', 0.25)}")
+      
 
     print(f"  Corruption: {'ON' if getattr(cfg, 'use_corruption', 0) else 'OFF'}"
           f"   Gabor aux: {'ON' if use_gabor else 'OFF'}")
@@ -171,6 +199,9 @@ def train_jepa(cfg, train_loader, eval_dict, id_map, n_classes):
         target_encoder.eval()
         if use_gabor:
             gabor_head.train()
+
+        gw = gabor_weight_at(epoch, cfg) if use_gabor else 0.0
+        gabor_active = use_gabor and gw > 1e-8
 
         ep_loss = 0.0          # raw JEPA term only — comparable across runs
         ep_var = 0.0
@@ -282,7 +313,7 @@ def train_jepa(cfg, train_loader, eval_dict, id_map, n_classes):
                   f"var={ep_var:.4f}  lr={lr_now:.2e}  "
                   f"mom={momentum:.4f}  [{elapsed:.1f}s]")
             if use_gabor:
-                print(f"           gabor: l_gab={ep_gab:.4f}  "
+                print(f"           gabor: w={gw:.4f}  l_gab={ep_gab:.4f}  "
                       f"cos={ep_gcos:.3f}  pred_var={ep_gpvar:.5f}")
 
         # Gradient-norm diagnostic: grads from the final batch are still live
