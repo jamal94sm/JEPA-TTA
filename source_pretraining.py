@@ -166,7 +166,6 @@ def train_jepa(cfg, train_loader, eval_dict, id_map, n_classes):
               f"schedule={getattr(cfg, 'gabor_schedule', 'constant')}  "
               f"w0={cfg.gabor_weight} -> wf={getattr(cfg, 'gabor_weight_final', 0.0)}  "
               f"end={getattr(cfg, 'gabor_schedule_end', 0.25)}")
-      
 
     print(f"  Corruption: {'ON' if getattr(cfg, 'use_corruption', 0) else 'OFF'}"
           f"   Gabor aux: {'ON' if use_gabor else 'OFF'}")
@@ -208,6 +207,7 @@ def train_jepa(cfg, train_loader, eval_dict, id_map, n_classes):
         ep_gab = 0.0           # Gabor auxiliary loss
         ep_gcos = 0.0          # cosine(pred, target) for the Gabor branch
         ep_gpvar = 0.0         # variance of Gabor head outputs (collapse check)
+        n_gab_bat = 0          # batches where the Gabor term was actually applied
         n_bat = 0
         t0 = time.time()
 
@@ -242,44 +242,51 @@ def train_jepa(cfg, train_loader, eval_dict, id_map, n_classes):
             loss_jepa = F.smooth_l1_loss(pred_embeds, tgt_embeds)
             loss = loss_jepa
 
+            # Sanity check runs on use_gabor (not gabor_active) so a 'ramp'
+            # schedule with gw=0 at epoch 1 still reports diagnostics.
+            if use_gabor and epoch == 1 and n_bat == 0:
+                with torch.no_grad():
+                    _desc = patch_energy_descriptor(
+                        gabor_bank(images), cfg.num_patches)
+                    _g_tgt = apply_masks(_desc, ctx_masks)
+                assert _g_tgt.shape[:2] == ctx_embeds.shape[:2], (
+                    f"Gabor/context mask misalignment: "
+                    f"g_tgt {tuple(_g_tgt.shape)} vs "
+                    f"ctx_embeds {tuple(ctx_embeds.shape)}")
+                rep = sanity_report(gabor_bank, images, cfg.num_patches)
+                print("\n  ── Gabor sanity check (epoch 1, batch 0) ──")
+                for k, v in rep.items():
+                    print(f"      {k}: {v}")
+                print(f"      ctx_embeds: {tuple(ctx_embeds.shape)}   "
+                      f"g_tgt: {tuple(_g_tgt.shape)}")
+                if rep["desc_pair_cos"] > 0.95:
+                    print("      !! WARNING: descriptors nearly identical "
+                          "across patches — target carries little signal.")
+                if not (0.99 < rep["desc_norm_mean"] < 1.01):
+                    print("      !! WARNING: descriptor norms != 1.0 "
+                          "— normalization broken.")
+                if rep["resp_absmean"] < 1e-6:
+                    print("      !! WARNING: Gabor responses ~0 "
+                          "— filter construction bug.")
+                print()
+
             # ─── Gabor auxiliary (A1): visible patches, clean-image target ───
-            if use_gabor:
+            if gabor_active:
                 with torch.no_grad():
                     desc = patch_energy_descriptor(
                         gabor_bank(images), cfg.num_patches)     # CLEAN image
                     g_tgt = apply_masks(desc, ctx_masks)         # CONTEXT masks
 
-                if epoch == 1 and n_bat == 0:
-                    assert g_tgt.shape[:2] == ctx_embeds.shape[:2], (
-                        f"Gabor/context mask misalignment: "
-                        f"g_tgt {tuple(g_tgt.shape)} vs "
-                        f"ctx_embeds {tuple(ctx_embeds.shape)}")
-                    rep = sanity_report(gabor_bank, images, cfg.num_patches)
-                    print("\n  ── Gabor sanity check (epoch 1, batch 0) ──")
-                    for k, v in rep.items():
-                        print(f"      {k}: {v}")
-                    print(f"      ctx_embeds: {tuple(ctx_embeds.shape)}   "
-                          f"g_tgt: {tuple(g_tgt.shape)}")
-                    if rep["desc_pair_cos"] > 0.95:
-                        print("      !! WARNING: descriptors nearly identical "
-                              "across patches — target carries little signal.")
-                    if not (0.99 < rep["desc_norm_mean"] < 1.01):
-                        print("      !! WARNING: descriptor norms != 1.0 "
-                              "— normalization broken.")
-                    if rep["resp_absmean"] < 1e-6:
-                        print("      !! WARNING: Gabor responses ~0 "
-                              "— filter construction bug.")
-                    print()
-
                 g_pred = F.normalize(gabor_head(ctx_embeds), dim=-1)
                 g_cos = F.cosine_similarity(g_pred, g_tgt, dim=-1)
                 l_gab = (1.0 - g_cos).mean()
-                loss = loss + cfg.gabor_weight * l_gab
+                loss = loss + gw * l_gab
 
                 ep_gab += l_gab.item()
                 ep_gcos += g_cos.mean().item()
                 ep_gpvar += g_pred.reshape(
                     -1, g_pred.size(-1)).var(dim=0).mean().item()
+                n_gab_bat += 1
 
             opt.zero_grad()
             loss.backward()
@@ -295,9 +302,9 @@ def train_jepa(cfg, train_loader, eval_dict, id_map, n_classes):
 
         ep_loss /= max(n_bat, 1)
         ep_var /= max(n_bat, 1)
-        ep_gab /= max(n_bat, 1)
-        ep_gcos /= max(n_bat, 1)
-        ep_gpvar /= max(n_bat, 1)
+        ep_gab /= max(n_gab_bat, 1)
+        ep_gcos /= max(n_gab_bat, 1)
+        ep_gpvar /= max(n_gab_bat, 1)
         elapsed = time.time() - t0
         lr_now = scheduler.get_last_lr()[0]
 
@@ -313,12 +320,15 @@ def train_jepa(cfg, train_loader, eval_dict, id_map, n_classes):
                   f"var={ep_var:.4f}  lr={lr_now:.2e}  "
                   f"mom={momentum:.4f}  [{elapsed:.1f}s]")
             if use_gabor:
-                print(f"           gabor: w={gw:.4f}  l_gab={ep_gab:.4f}  "
-                      f"cos={ep_gcos:.3f}  pred_var={ep_gpvar:.5f}")
+                if gabor_active:
+                    print(f"           gabor: w={gw:.4f}  l_gab={ep_gab:.4f}  "
+                          f"cos={ep_gcos:.3f}  pred_var={ep_gpvar:.5f}")
+                else:
+                    print(f"           gabor: w={gw:.4f}  (inactive this epoch)")
 
         # Gradient-norm diagnostic: grads from the final batch are still live
         # here (zero_grad happens at the start of the next iteration).
-        if use_gabor and (epoch % cfg.gabor_log_every == 0 or epoch == 1):
+        if gabor_active and (epoch % cfg.gabor_log_every == 0 or epoch == 1):
             with torch.no_grad():
                 head_gnorm = sum(
                     p.grad.norm().item() ** 2
@@ -341,6 +351,7 @@ def train_jepa(cfg, train_loader, eval_dict, id_map, n_classes):
 
             eval_entry = {"epoch": epoch, "loss": ep_loss, "sim": sim}
             if use_gabor:
+                eval_entry["gabor_w"] = gw
                 eval_entry["l_gab"] = ep_gab
                 eval_entry["gabor_cos"] = ep_gcos
             mean_r1 = np.mean([r["rank1"] for r in eval_results.values()])
@@ -368,9 +379,13 @@ def train_jepa(cfg, train_loader, eval_dict, id_map, n_classes):
                 }
                 if use_gabor:
                     ckpt["gabor_head"] = gabor_head.state_dict()
-                    ckpt["gabor_cfg"] = {"orient": cfg.gabor_orient,
-                                         "K": gabor_bank.K,
-                                         "weight": cfg.gabor_weight}
+                    ckpt["gabor_cfg"] = {
+                        "orient": cfg.gabor_orient,
+                        "K": gabor_bank.K,
+                        "per_channel": gabor_bank.per_channel,
+                        "weight": cfg.gabor_weight,
+                        "schedule": getattr(cfg, "gabor_schedule", "constant"),
+                    }
                 torch.save(ckpt, ckpt_path)
                 print(f"    ★ New best R1={mean_r1:.2f}% "
                       f"EER={mean_eer:.2f}% → saved")
@@ -395,7 +410,11 @@ def train_jepa(cfg, train_loader, eval_dict, id_map, n_classes):
                 "use_corruption": int(getattr(cfg, "use_corruption", 0)),
                 "use_gabor": int(use_gabor),
                 "gabor_weight": float(getattr(cfg, "gabor_weight", 0.0)),
+                "gabor_weight_final": float(getattr(cfg, "gabor_weight_final", 0.0)),
+                "gabor_schedule": getattr(cfg, "gabor_schedule", "constant"),
+                "gabor_schedule_end": float(getattr(cfg, "gabor_schedule_end", 0.25)),
                 "gabor_orient": int(getattr(cfg, "gabor_orient", 0)),
+                "gabor_gray": int(getattr(cfg, "gabor_gray", 1)),
             },
             "best": best_eval, "history": eval_history,
         }, f, indent=2)
