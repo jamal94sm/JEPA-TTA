@@ -108,6 +108,30 @@ def get_cfg(args=None):
     p.add_argument("--gabor_gray", type=int, default=1, choices=[0, 1],
                    help="1 = collapse to grayscale (correct for CASIA). "
                         "0 = per-channel Gabor (RGB datasets, e.g. XJTU).")
+
+    # ─── Structural task selection (A1 / A2) ──────────────────
+    p.add_argument("--struct_mode", default="none",
+                   choices=["none", "a1", "a2", "both"],
+                   help="a1 = structure on visible patches (via ctx_embeds). "
+                        "a2 = structure on hidden patches (via predictor). "
+                        "both = A1+A2 sharing one structure head.")
+    p.add_argument("--w_a1", type=float, default=0.3)
+    p.add_argument("--w_a2", type=float, default=0.3)
+    p.add_argument("--struct_head_hidden", type=int, default=128)
+
+    # ─── Structural loss form ─────────────────────────────────
+    p.add_argument("--struct_loss", default="cosine",
+                   choices=["cosine", "infonce", "smooth_l1"])
+    p.add_argument("--infonce_temp", type=float, default=0.1)
+    p.add_argument("--infonce_max_n", type=int, default=4096)
+
+    # ─── Task weighting ───────────────────────────────────────
+    p.add_argument("--task_weighting", default="fixed",
+                   choices=["fixed", "uncertainty"])
+
+    # ─── Diagnostics ──────────────────────────────────────────
+    p.add_argument("--log_conflict", type=int, default=1, choices=[0, 1],
+                   help="Log cosine between task gradients on shared params.")
     
     # ─── Misc ─────────────────────────────────────────────────
     p.add_argument("--seed", type=int, default=2025)
