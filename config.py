@@ -97,7 +97,17 @@ def get_cfg(args=None):
     p.add_argument("--gabor_orient", type=int, default=8)
     p.add_argument("--gabor_log_every", type=int, default=5,
                    help="Print Gabor diagnostics every N epochs.")
-
+    p.add_argument("--gabor_schedule", default="constant",
+                   choices=["constant", "decay", "ramp", "cosine"],
+                   help="constant: fixed weight. decay: w -> w_final over "
+                        "schedule_end. ramp: 0 -> w over schedule_end. "
+                        "cosine: w -> w_final over full training.")
+    p.add_argument("--gabor_weight_final", type=float, default=0.0)
+    p.add_argument("--gabor_schedule_end", type=float, default=0.25,
+                   help="Fraction of total epochs the ramp/decay spans.")
+    p.add_argument("--gabor_gray", type=int, default=1, choices=[0, 1],
+                   help="1 = collapse to grayscale (correct for CASIA). "
+                        "0 = per-channel Gabor (RGB datasets, e.g. XJTU).")
     
     # ─── Misc ─────────────────────────────────────────────────
     p.add_argument("--seed", type=int, default=2025)
