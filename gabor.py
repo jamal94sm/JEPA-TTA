@@ -22,18 +22,18 @@ def gabor_kernel(ksize, sigma, lambd, theta, gamma=0.5, psi=0.0):
 
 
 class GaborBank(nn.Module):
-    """Fixed multi-scale, multi-orientation Gabor bank. (B,3,H,W) -> (B,K,H,W)."""
-
     def __init__(self, n_orient=8,
                  scales=((9, 3.0, 6.0), (15, 5.0, 10.0), (21, 7.0, 14.0)),
-                 gamma=0.5):
+                 gamma=0.5, per_channel=False):
         super().__init__()
         self.n_orient = n_orient
         self.n_scales = len(scales)
-        self.K = n_orient * self.n_scales
+        self.per_channel = per_channel
+        n_filters = n_orient * self.n_scales
+        self.K = n_filters * (3 if per_channel else 1)   # output channels
 
         max_k = max(s[0] for s in scales)
-        bank = torch.zeros(self.K, 1, max_k, max_k)
+        bank = torch.zeros(n_filters, 1, max_k, max_k)
         idx = 0
         for (ksize, sigma, lambd) in scales:
             for o in range(n_orient):
@@ -42,11 +42,14 @@ class GaborBank(nn.Module):
                 pad = (max_k - ksize) // 2
                 bank[idx, 0, pad:pad + ksize, pad:pad + ksize] = k
                 idx += 1
-        self.register_buffer("weight", bank)      # buffer, NOT Parameter
+        self.register_buffer("weight", bank)
         self.pad = max_k // 2
 
     @torch.no_grad()
     def forward(self, x):
+        if self.per_channel:
+            w = self.weight.repeat(3, 1, 1, 1)            # (3*n_filters,1,k,k)
+            return F.conv2d(x, w, padding=self.pad, groups=3)
         gray = x.mean(dim=1, keepdim=True)
         return F.conv2d(gray, self.weight, padding=self.pad)
 
