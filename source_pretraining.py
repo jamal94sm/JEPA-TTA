@@ -48,11 +48,12 @@ from dataset import build_datasets
 from models import (ContextEncoder, TargetEncoder, Predictor,
                     FeatureExtractor, patchify, apply_masks,
                     repeat_interleave_batch, update_ema, CompNet, PlainViT,
-                    FeatModule, GaborHead)
+                    FeatModule, StructureHead, UncertaintyWeighting)
 
 from evaluate import run_full_eval
 from corruption import corrupt_images
 from gabor import GaborBank, patch_energy_descriptor, sanity_report
+from struct_loss import structure_loss, grad_conflict_cosine
 
 CASIA_MEAN = [0.5, 0.5, 0.5]                    # matches dataset.py's Normalize()
 CASIA_STD  = [0.5, 0.5, 0.5]
@@ -147,32 +148,43 @@ def train_jepa(cfg, train_loader, eval_dict, id_map, n_classes):
     print(f"  Context encoder: {n_ctx/1e6:.2f}M params")
     print(f"  Predictor: {n_pred/1e6:.2f}M params")
 
-    # ─── Gabor structural auxiliary head (design A1) ──────────
-    use_gabor = bool(getattr(cfg, "use_gabor", 0)) and \
-                float(getattr(cfg, "gabor_weight", 0.0)) > 0.0
-    gabor_bank = gabor_head = None
-    if use_gabor:
+    # ─── Structural auxiliary tasks (A1 = visible, A2 = hidden) ───
+    use_a1 = bool(getattr(cfg, "use_a1", False))
+    use_a2 = bool(getattr(cfg, "use_a2", False))
+    use_struct = use_a1 or use_a2
+    gabor_bank = struct_head = task_weighter = None
+
+    if use_struct:
         gabor_bank = GaborBank(
             n_orient=cfg.gabor_orient,
             per_channel=not bool(getattr(cfg, "gabor_gray", 1)),
         ).to(cfg.device)
-        gabor_head = GaborHead(cfg.embed_dim, gabor_bank.K).to(cfg.device)
-        n_gab = sum(p.numel() for p in gabor_head.parameters())
+        struct_head = StructureHead(
+            cfg.embed_dim, gabor_bank.K,
+            hidden=cfg.struct_head_hidden).to(cfg.device)
+        n_sh = sum(p.numel() for p in struct_head.parameters())
+
+        n_tasks = 1 + int(use_a1) + int(use_a2)
+        if cfg.task_weighting == "uncertainty":
+            task_weighter = UncertaintyWeighting(n_tasks).to(cfg.device)
+
         mode = "per-channel RGB" if gabor_bank.per_channel else "grayscale"
-        print(f"  Gabor bank: K={gabor_bank.K} channels "
-              f"({cfg.gabor_orient} orient x {gabor_bank.n_scales} scales, {mode}), "
-              f"trainable={gabor_bank.weight.requires_grad}")
-        print(f"  Gabor head: {n_gab/1e6:.3f}M params   "
-              f"schedule={getattr(cfg, 'gabor_schedule', 'constant')}  "
-              f"w0={cfg.gabor_weight} -> wf={getattr(cfg, 'gabor_weight_final', 0.0)}  "
-              f"end={getattr(cfg, 'gabor_schedule_end', 0.25)}")
+        print(f"  Gabor bank: K={gabor_bank.K} "
+              f"({cfg.gabor_orient} orient x {gabor_bank.n_scales} scales, {mode})")
+        print(f"  Structure head: {n_sh/1e6:.3f}M params "
+              f"(hidden={cfg.struct_head_hidden} -> {gabor_bank.K})")
+        print(f"  Struct mode: {cfg.struct_mode}   loss={cfg.struct_loss}   "
+              f"weighting={cfg.task_weighting}   "
+              f"w_a1={cfg.w_a1}  w_a2={cfg.w_a2}")
 
     print(f"  Corruption: {'ON' if getattr(cfg, 'use_corruption', 0) else 'OFF'}"
-          f"   Gabor aux: {'ON' if use_gabor else 'OFF'}")
+          f"   Structural: {'ON' if use_struct else 'OFF'}")
 
     train_params = list(context_encoder.parameters()) + list(predictor.parameters())
-    if use_gabor:
-        train_params += list(gabor_head.parameters())
+    if use_struct:
+        train_params += list(struct_head.parameters())
+    if task_weighter is not None:
+        train_params += list(task_weighter.parameters())
     opt = torch.optim.AdamW(train_params, lr=cfg.learning_rate,
                             weight_decay=cfg.weight_decay)
 
@@ -196,18 +208,15 @@ def train_jepa(cfg, train_loader, eval_dict, id_map, n_classes):
         context_encoder.train()
         predictor.train()
         target_encoder.eval()
-        if use_gabor:
-            gabor_head.train()
-
-        gw = gabor_weight_at(epoch, cfg) if use_gabor else 0.0
-        gabor_active = use_gabor and gw > 1e-8
+        if use_struct:
+            struct_head.train()
 
         ep_loss = 0.0          # raw JEPA term only — comparable across runs
         ep_var = 0.0
-        ep_gab = 0.0           # Gabor auxiliary loss
-        ep_gcos = 0.0          # cosine(pred, target) for the Gabor branch
-        ep_gpvar = 0.0         # variance of Gabor head outputs (collapse check)
-        n_gab_bat = 0          # batches where the Gabor term was actually applied
+        ep_a1 = ep_a1_cos = ep_a1_top1 = 0.0
+        ep_a2 = ep_a2_cos = ep_a2_top1 = 0.0
+        n_a1 = n_a2 = 0
+        ep_conflict = float("nan")
         n_bat = 0
         t0 = time.time()
 
@@ -237,56 +246,96 @@ def train_jepa(cfg, train_loader, eval_dict, id_map, n_classes):
                 tgt_embeds = repeat_interleave_batch(
                     tgt_embeds, B, repeat=len(ctx_masks))
 
-            pred_embeds = predictor(ctx_embeds, ctx_masks, tgt_masks)
+            # A2 requests the extra structure query from the shared predictor.
+            if use_a2:
+                pred_embeds, struct_hidden = predictor(
+                    ctx_embeds, ctx_masks, tgt_masks, predict_structure=True)
+            else:
+                pred_embeds = predictor(ctx_embeds, ctx_masks, tgt_masks)
 
             loss_jepa = F.smooth_l1_loss(pred_embeds, tgt_embeds)
-            loss = loss_jepa
 
-            # Sanity check runs on use_gabor (not gabor_active) so a 'ramp'
-            # schedule with gw=0 at epoch 1 still reports diagnostics.
-            if use_gabor and epoch == 1 and n_bat == 0:
-                with torch.no_grad():
-                    _desc = patch_energy_descriptor(
-                        gabor_bank(images), cfg.num_patches)
-                    _g_tgt = apply_masks(_desc, ctx_masks)
-                assert _g_tgt.shape[:2] == ctx_embeds.shape[:2], (
-                    f"Gabor/context mask misalignment: "
-                    f"g_tgt {tuple(_g_tgt.shape)} vs "
-                    f"ctx_embeds {tuple(ctx_embeds.shape)}")
-                rep = sanity_report(gabor_bank, images, cfg.num_patches)
-                print("\n  ── Gabor sanity check (epoch 1, batch 0) ──")
-                for k, v in rep.items():
-                    print(f"      {k}: {v}")
-                print(f"      ctx_embeds: {tuple(ctx_embeds.shape)}   "
-                      f"g_tgt: {tuple(_g_tgt.shape)}")
-                if rep["desc_pair_cos"] > 0.95:
-                    print("      !! WARNING: descriptors nearly identical "
-                          "across patches — target carries little signal.")
-                if not (0.99 < rep["desc_norm_mean"] < 1.01):
-                    print("      !! WARNING: descriptor norms != 1.0 "
-                          "— normalization broken.")
-                if rep["resp_absmean"] < 1e-6:
-                    print("      !! WARNING: Gabor responses ~0 "
-                          "— filter construction bug.")
-                print()
-
-            # ─── Gabor auxiliary (A1): visible patches, clean-image target ───
-            if gabor_active:
+            l_a1 = l_a2 = None
+            if use_struct:
                 with torch.no_grad():
                     desc = patch_energy_descriptor(
-                        gabor_bank(images), cfg.num_patches)     # CLEAN image
-                    g_tgt = apply_masks(desc, ctx_masks)         # CONTEXT masks
+                        gabor_bank(images), cfg.num_patches)   # CLEAN image
 
-                g_pred = F.normalize(gabor_head(ctx_embeds), dim=-1)
-                g_cos = F.cosine_similarity(g_pred, g_tgt, dim=-1)
-                l_gab = (1.0 - g_cos).mean()
-                loss = loss + gw * l_gab
+                if use_a1:
+                    t_a1 = apply_masks(desc, ctx_masks)        # visible patches
+                    if epoch == 1 and n_bat == 0:
+                        assert t_a1.shape[:2] == ctx_embeds.shape[:2], (
+                            f"A1 misalignment: t_a1 {tuple(t_a1.shape)} vs "
+                            f"ctx_embeds {tuple(ctx_embeds.shape)}")
+                    l_a1, s_a1 = structure_loss(
+                        struct_head(ctx_embeds), t_a1,
+                        kind=cfg.struct_loss,
+                        temperature=cfg.infonce_temp,
+                        max_n=cfg.infonce_max_n)
+                    ep_a1 += l_a1.item()
+                    ep_a1_cos += s_a1["cos"]
+                    ep_a1_top1 += s_a1["top1"]
+                    n_a1 += 1
 
-                ep_gab += l_gab.item()
-                ep_gcos += g_cos.mean().item()
-                ep_gpvar += g_pred.reshape(
-                    -1, g_pred.size(-1)).var(dim=0).mean().item()
-                n_gab_bat += 1
+                if use_a2:
+                    t_a2 = repeat_interleave_batch(
+                        apply_masks(desc, tgt_masks), B,
+                        repeat=len(ctx_masks))                 # hidden patches
+                    if epoch == 1 and n_bat == 0:
+                        assert t_a2.shape[:2] == struct_hidden.shape[:2], (
+                            f"A2 misalignment: t_a2 {tuple(t_a2.shape)} vs "
+                            f"struct_hidden {tuple(struct_hidden.shape)}")
+                    l_a2, s_a2 = structure_loss(
+                        struct_head(struct_hidden), t_a2,
+                        kind=cfg.struct_loss,
+                        temperature=cfg.infonce_temp,
+                        max_n=cfg.infonce_max_n)
+                    ep_a2 += l_a2.item()
+                    ep_a2_cos += s_a2["cos"]
+                    ep_a2_top1 += s_a2["top1"]
+                    n_a2 += 1
+
+                if epoch == 1 and n_bat == 0:
+                    rep = sanity_report(gabor_bank, images, cfg.num_patches)
+                    print("\n  ── Structural sanity check (epoch 1, batch 0) ──")
+                    for k, v in rep.items():
+                        print(f"      {k}: {v}")
+                    if rep["desc_pair_cos"] > 0.95:
+                        print("      !! WARNING: descriptors nearly identical "
+                              "across patches — target carries little signal.")
+                    if not (0.99 < rep["desc_norm_mean"] < 1.01):
+                        print("      !! WARNING: descriptor norms != 1.0.")
+                    if rep["resp_absmean"] < 1e-6:
+                        print("      !! WARNING: Gabor responses ~0.")
+                    print()
+
+            # ─── Combine task losses ───
+            if task_weighter is not None:
+                terms = [loss_jepa]
+                if l_a1 is not None:
+                    terms.append(l_a1)
+                if l_a2 is not None:
+                    terms.append(l_a2)
+                loss = task_weighter(terms)
+            else:
+                loss = loss_jepa
+                if l_a1 is not None:
+                    loss = loss + cfg.w_a1 * l_a1
+                if l_a2 is not None:
+                    loss = loss + cfg.w_a2 * l_a2
+
+            # ─── Gradient-conflict diagnostic on shared params ───
+            # >0 complementary, ~0 orthogonal, <0 conflicting.
+            if (use_struct and cfg.log_conflict and n_bat == 0
+                    and (epoch % cfg.gabor_log_every == 0 or epoch == 1)):
+                l_struct_tot = 0.0
+                if l_a1 is not None:
+                    l_struct_tot = l_struct_tot + l_a1
+                if l_a2 is not None:
+                    l_struct_tot = l_struct_tot + l_a2
+                ep_conflict = grad_conflict_cosine(
+                    loss_jepa, l_struct_tot,
+                    list(context_encoder.norm.parameters()))
 
             opt.zero_grad()
             loss.backward()
@@ -302,9 +351,12 @@ def train_jepa(cfg, train_loader, eval_dict, id_map, n_classes):
 
         ep_loss /= max(n_bat, 1)
         ep_var /= max(n_bat, 1)
-        ep_gab /= max(n_gab_bat, 1)
-        ep_gcos /= max(n_gab_bat, 1)
-        ep_gpvar /= max(n_gab_bat, 1)
+        ep_a1 /= max(n_a1, 1)
+        ep_a1_cos /= max(n_a1, 1)
+        ep_a1_top1 /= max(n_a1, 1)
+        ep_a2 /= max(n_a2, 1)
+        ep_a2_cos /= max(n_a2, 1)
+        ep_a2_top1 /= max(n_a2, 1)
         elapsed = time.time() - t0
         lr_now = scheduler.get_last_lr()[0]
 
@@ -319,28 +371,18 @@ def train_jepa(cfg, train_loader, eval_dict, id_map, n_classes):
                   f"loss={ep_loss:.4f}  sim={sim:.3f}  "
                   f"var={ep_var:.4f}  lr={lr_now:.2e}  "
                   f"mom={momentum:.4f}  [{elapsed:.1f}s]")
-            if use_gabor:
-                if gabor_active:
-                    print(f"           gabor: w={gw:.4f}  l_gab={ep_gab:.4f}  "
-                          f"cos={ep_gcos:.3f}  pred_var={ep_gpvar:.5f}")
-                else:
-                    print(f"           gabor: w={gw:.4f}  (inactive this epoch)")
-
-        # Gradient-norm diagnostic: grads from the final batch are still live
-        # here (zero_grad happens at the start of the next iteration).
-        if gabor_active and (epoch % cfg.gabor_log_every == 0 or epoch == 1):
-            with torch.no_grad():
-                head_gnorm = sum(
-                    p.grad.norm().item() ** 2
-                    for p in gabor_head.parameters()
-                    if p.grad is not None) ** 0.5
-                enc_gnorm = sum(
-                    p.grad.norm().item() ** 2
-                    for p in context_encoder.parameters()
-                    if p.grad is not None) ** 0.5
-            ratio = head_gnorm / max(enc_gnorm, 1e-12)
-            print(f"           grad norms: gabor_head={head_gnorm:.4f}  "
-                  f"context_encoder={enc_gnorm:.4f}  ratio={ratio:.2f}")
+            if use_a1:
+                print(f"           A1 (visible): loss={ep_a1:.4f}  "
+                      f"cos={ep_a1_cos:.3f}  top1={ep_a1_top1:.3f}")
+            if use_a2:
+                print(f"           A2 (hidden):  loss={ep_a2:.4f}  "
+                      f"cos={ep_a2_cos:.3f}  top1={ep_a2_top1:.3f}")
+            if use_struct and cfg.log_conflict:
+                msg = f"           conflict_cos={ep_conflict:+.4f}"
+                if task_weighter is not None:
+                    ws = "  ".join(f"{w:.3f}" for w in task_weighter.weights())
+                    msg += f"   learned_w=[{ws}]"
+                print(msg)
 
         if epoch % cfg.eval_every == 0 or epoch == cfg.epochs:
             print(f"\n  ── Eval at epoch {epoch} ──")
@@ -349,11 +391,21 @@ def train_jepa(cfg, train_loader, eval_dict, id_map, n_classes):
                 feature_extractor, eval_dict, cfg,
                 tag=f"[ep{epoch}] ")
 
-            eval_entry = {"epoch": epoch, "loss": ep_loss, "sim": sim}
-            if use_gabor:
-                eval_entry["gabor_w"] = gw
-                eval_entry["l_gab"] = ep_gab
-                eval_entry["gabor_cos"] = ep_gcos
+            eval_entry = {"epoch": epoch, "loss": ep_loss, "sim": sim,
+                          "var": ep_var}
+            if use_a1:
+                eval_entry["l_a1"] = ep_a1
+                eval_entry["a1_cos"] = ep_a1_cos
+                eval_entry["a1_top1"] = ep_a1_top1
+            if use_a2:
+                eval_entry["l_a2"] = ep_a2
+                eval_entry["a2_cos"] = ep_a2_cos
+                eval_entry["a2_top1"] = ep_a2_top1
+            if use_struct:
+                eval_entry["conflict_cos"] = ep_conflict
+                if task_weighter is not None:
+                    eval_entry["learned_w"] = task_weighter.weights()
+
             mean_r1 = np.mean([r["rank1"] for r in eval_results.values()])
             mean_eer = np.mean([r["eer"] for r in eval_results.values()])
             eval_entry["mean_rank1"] = mean_r1
@@ -377,15 +429,19 @@ def train_jepa(cfg, train_loader, eval_dict, id_map, n_classes):
                              "img_size": cfg.img_size},
                     "mean_rank1": mean_r1,
                 }
-                if use_gabor:
-                    ckpt["gabor_head"] = gabor_head.state_dict()
-                    ckpt["gabor_cfg"] = {
-                        "orient": cfg.gabor_orient,
-                        "K": gabor_bank.K,
+                if use_struct:
+                    ckpt["struct_head"] = struct_head.state_dict()
+                    ckpt["struct_cfg"] = {
+                        "struct_mode": cfg.struct_mode,
+                        "struct_loss": cfg.struct_loss,
+                        "w_a1": cfg.w_a1, "w_a2": cfg.w_a2,
+                        "task_weighting": cfg.task_weighting,
+                        "gabor_orient": cfg.gabor_orient,
+                        "gabor_K": gabor_bank.K,
                         "per_channel": gabor_bank.per_channel,
-                        "weight": cfg.gabor_weight,
-                        "schedule": getattr(cfg, "gabor_schedule", "constant"),
                     }
+                    if task_weighter is not None:
+                        ckpt["task_weighter"] = task_weighter.state_dict()
                 torch.save(ckpt, ckpt_path)
                 print(f"    ★ New best R1={mean_r1:.2f}% "
                       f"EER={mean_eer:.2f}% → saved")
@@ -393,7 +449,7 @@ def train_jepa(cfg, train_loader, eval_dict, id_map, n_classes):
             print(f"    Summary: Mean R1={mean_r1:.2f}% | "
                   f"Mean EER={mean_eer:.2f}%\n")
 
-    _print_history_jepa(eval_history, eval_dict, use_gabor)
+    _print_history_jepa(eval_history, eval_dict, use_a1, use_a2)
     _print_footer(cfg, best_eval)
 
     save_path = os.path.join(cfg.output_dir,
@@ -408,18 +464,55 @@ def train_jepa(cfg, train_loader, eval_dict, id_map, n_classes):
                 "train_spectrums": cfg.train_spectrums,
                 "aug_multiplier": cfg.aug_multiplier,
                 "use_corruption": int(getattr(cfg, "use_corruption", 0)),
-                "use_gabor": int(use_gabor),
-                "gabor_weight": float(getattr(cfg, "gabor_weight", 0.0)),
-                "gabor_weight_final": float(getattr(cfg, "gabor_weight_final", 0.0)),
-                "gabor_schedule": getattr(cfg, "gabor_schedule", "constant"),
-                "gabor_schedule_end": float(getattr(cfg, "gabor_schedule_end", 0.25)),
-                "gabor_orient": int(getattr(cfg, "gabor_orient", 0)),
+                "struct_mode": cfg.struct_mode,
+                "struct_loss": cfg.struct_loss,
+                "w_a1": float(cfg.w_a1),
+                "w_a2": float(cfg.w_a2),
+                "struct_head_hidden": int(cfg.struct_head_hidden),
+                "task_weighting": cfg.task_weighting,
+                "infonce_temp": float(cfg.infonce_temp),
+                "gabor_orient": int(cfg.gabor_orient),
                 "gabor_gray": int(getattr(cfg, "gabor_gray", 1)),
             },
             "best": best_eval, "history": eval_history,
         }, f, indent=2)
     print(f"\n  Saved: {save_path}")
 
+
+def _print_history_jepa(eval_history, eval_dict, use_a1=False, use_a2=False):
+    eval_names = list(eval_dict.keys())
+    print(f"\n  {'Epoch':>6} {'Loss':>8} {'Sim':>6}", end="")
+    if use_a1:
+        print(f" {'l_a1':>7} {'a1cos':>6}", end="")
+    if use_a2:
+        print(f" {'l_a2':>7} {'a2cos':>6}", end="")
+    for name in eval_names:
+        print(f" │ {name[:12]:>12} R1   EER", end="")
+    print()
+    print(f"  {'─'*8}{'─'*8}{'─'*6}", end="")
+    if use_a1:
+        print(f"{'─'*7}{'─'*6}", end="")
+    if use_a2:
+        print(f"{'─'*7}{'─'*6}", end="")
+    for _ in eval_names:
+        print(f"─┼─{'─'*24}", end="")
+    print()
+    for entry in eval_history:
+        print(f"  {entry['epoch']:>6} {entry['loss']:>8.4f} "
+              f"{entry['sim']:>6.3f}", end="")
+        if use_a1:
+            print(f" {entry.get('l_a1', float('nan')):>7.4f} "
+                  f"{entry.get('a1_cos', float('nan')):>6.3f}", end="")
+        if use_a2:
+            print(f" {entry.get('l_a2', float('nan')):>7.4f} "
+                  f"{entry.get('a2_cos', float('nan')):>6.3f}", end="")
+        for name in eval_names:
+            if name in entry:
+                r = entry[name]
+                print(f" │ {r['rank1']:>6.2f} {r['eer']:>6.2f}", end="")
+            else:
+                print(f" │ {'---':>6} {'---':>6}", end="")
+        print()
 
 # ══════════════════════════════════════════════════════════════
 #  CompNet (supervised cross-entropy on training IDs)
