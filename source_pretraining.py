@@ -173,7 +173,8 @@ def train_jepa(cfg, train_loader, eval_dict, id_map, n_classes):
               f"({cfg.gabor_orient} orient x {gabor_bank.n_scales} scales, {mode})")
         print(f"  Structure head: {n_sh/1e6:.3f}M params "
               f"(hidden={cfg.struct_head_hidden} -> {gabor_bank.K})")
-        print(f"  Struct mode: {cfg.struct_mode}   loss={cfg.struct_loss}   "
+        print(f"  Struct mode: {cfg.struct_mode}   "
+              f"loss_a1={cfg.loss_a1}  loss_a2={cfg.loss_a2}   "
               f"weighting={cfg.task_weighting}   "
               f"w_a1={cfg.w_a1}  w_a2={cfg.w_a2}")
 
@@ -269,7 +270,7 @@ def train_jepa(cfg, train_loader, eval_dict, id_map, n_classes):
                             f"ctx_embeds {tuple(ctx_embeds.shape)}")
                     l_a1, s_a1 = structure_loss(
                         struct_head(ctx_embeds), t_a1,
-                        kind=cfg.struct_loss,
+                        kind=cfg.loss_a1,
                         temperature=cfg.infonce_temp,
                         max_n=cfg.infonce_max_n)
                     ep_a1 += l_a1.item()
@@ -287,7 +288,7 @@ def train_jepa(cfg, train_loader, eval_dict, id_map, n_classes):
                             f"struct_hidden {tuple(struct_hidden.shape)}")
                     l_a2, s_a2 = structure_loss(
                         struct_head(struct_hidden), t_a2,
-                        kind=cfg.struct_loss,
+                        kind=cfg.loss_a2,
                         temperature=cfg.infonce_temp,
                         max_n=cfg.infonce_max_n)
                     ep_a2 += l_a2.item()
@@ -433,7 +434,8 @@ def train_jepa(cfg, train_loader, eval_dict, id_map, n_classes):
                     ckpt["struct_head"] = struct_head.state_dict()
                     ckpt["struct_cfg"] = {
                         "struct_mode": cfg.struct_mode,
-                        "struct_loss": cfg.struct_loss,
+                        "loss_a1": cfg.loss_a1,
+                        "loss_a2": cfg.loss_a2,
                         "w_a1": cfg.w_a1, "w_a2": cfg.w_a2,
                         "task_weighting": cfg.task_weighting,
                         "gabor_orient": cfg.gabor_orient,
