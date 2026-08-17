@@ -122,7 +122,9 @@ def get_cfg(args=None):
     p.add_argument("--w_a1", type=float, default=0.3)
     p.add_argument("--w_a2", type=float, default=0.3)
     p.add_argument("--struct_head_hidden", type=int, default=128)
-
+    p.add_argument("--struct_head_mode", default="shared",
+               choices=["shared", "separate"])
+    
     # ─── Structural loss form ─────────────────────────────────
     # ─── Structural loss form ─────────────────────────────────
     p.add_argument("--struct_loss", default="cosine",
