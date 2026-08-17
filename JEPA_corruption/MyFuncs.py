@@ -7,6 +7,8 @@ import MyModels
 import MyUtils
 import Utils as root_utils
 import periodic_eval
+from gabor import GaborBank, patch_energy_descriptor, sanity_report
+from struct_loss import structure_loss, grad_conflict_cosine
 
 
 CORRUPT_BLUE, CORRUPT_RED, CORRUPT_GREEN, CORRUPT_JITTER, CORRUPT_NOISE = 0, 1, 2, 3, 4
@@ -268,6 +270,9 @@ def Train(
     momentum_schedule,
     checkpoint_state,
     args,
+    gabor_bank=None,
+    struct_head=None,
+    task_weighter=None,
 ):
     device = args.device
     epoch_losses = []
@@ -276,6 +281,10 @@ def Train(
     run_dir = checkpoint_state["run_dir"]
     best_acc = checkpoint_state.get("best_acc", checkpoint_state.get("best_loss", float("-inf")))
     eval_history = list(checkpoint_state.get("eval_history", []))
+
+    use_a1 = struct_head is not None and bool(getattr(args, "use_a1", False))
+    use_a2 = struct_head is not None and bool(getattr(args, "use_a2", False))
+    use_struct = use_a1 or use_a2
 
     for _ in range(global_step):
         lr_scheduler.step()
@@ -286,12 +295,19 @@ def Train(
         context_encoder.train()
         predictor.train()
         target_encoder.eval()
+        if use_struct:
+            struct_head.train()
 
         pbar = root_utils.make_epoch_progress_bar(dataloader, epoch, args)
         epoch_loss = 0.0
         n_batches = 0
         epoch_var_sum = 0.0
         epoch_var_count = 0
+
+        ep_a1 = ep_a1_cos = ep_a1_top1 = 0.0
+        ep_a2 = ep_a2_cos = ep_a2_top1 = 0.0
+        n_a1 = n_a2 = 0
+        ep_conflict = float("nan")
 
         for images, _ in pbar:
             images = images.to(device)
@@ -321,8 +337,100 @@ def Train(
                     target_embeddings, B, repeat=len(context_masks)
                 )
 
-            pred_embeddings = predictor(context_embeddings, context_masks, target_masks)
-            loss = MSE_loss(pred_embeddings, target_embeddings)
+            # A2 requests the extra structure query from the shared predictor.
+            if use_a2:
+                pred_embeddings, struct_hidden = predictor(
+                    context_embeddings, context_masks, target_masks,
+                    predict_structure=True)
+            else:
+                pred_embeddings = predictor(
+                    context_embeddings, context_masks, target_masks)
+
+            loss_jepa = MSE_loss(pred_embeddings, target_embeddings)
+            loss = loss_jepa
+
+            l_a1 = l_a2 = None
+            if use_struct:
+                with torch.no_grad():
+                    desc = patch_energy_descriptor(
+                        gabor_bank(images), args.num_patches)   # CLEAN image
+
+                if use_a1:
+                    t_a1 = MyUtils.apply_masks(desc, context_masks)   # visible patches
+                    if epoch == start_epoch and n_batches == 0:
+                        assert t_a1.shape[:2] == context_embeddings.shape[:2], (
+                            f"A1 misalignment: t_a1 {tuple(t_a1.shape)} vs "
+                            f"context_embeddings {tuple(context_embeddings.shape)}")
+                    l_a1, s_a1 = structure_loss(
+                        struct_head(context_embeddings), t_a1,
+                        kind=args.loss_a1,
+                        temperature=args.infonce_temp,
+                        max_n=args.infonce_max_n)
+                    ep_a1 += l_a1.item()
+                    ep_a1_cos += s_a1["cos"]
+                    if s_a1["top1"] == s_a1["top1"]:   # skip NaN (non-InfoNCE)
+                        ep_a1_top1 += s_a1["top1"]
+                    n_a1 += 1
+
+                if use_a2:
+                    t_a2 = MyUtils._repeat_interleave_batch(
+                        MyUtils.apply_masks(desc, target_masks), B,
+                        repeat=len(context_masks))               # hidden patches
+                    if epoch == start_epoch and n_batches == 0:
+                        assert t_a2.shape[:2] == struct_hidden.shape[:2], (
+                            f"A2 misalignment: t_a2 {tuple(t_a2.shape)} vs "
+                            f"struct_hidden {tuple(struct_hidden.shape)}")
+                    l_a2, s_a2 = structure_loss(
+                        struct_head(struct_hidden), t_a2,
+                        kind=args.loss_a2,
+                        temperature=args.infonce_temp,
+                        max_n=args.infonce_max_n)
+                    ep_a2 += l_a2.item()
+                    ep_a2_cos += s_a2["cos"]
+                    if s_a2["top1"] == s_a2["top1"]:
+                        ep_a2_top1 += s_a2["top1"]
+                    n_a2 += 1
+
+                if epoch == start_epoch and n_batches == 0:
+                    rep = sanity_report(gabor_bank, images, args.num_patches)
+                    print("\n── Structural sanity check (epoch 1, batch 0) ──")
+                    for k, v in rep.items():
+                        print(f"    {k}: {v}")
+                    if rep["desc_pair_cos"] > 0.95:
+                        print("    !! WARNING: descriptors nearly identical "
+                              "across patches — target carries little signal.")
+                    if not (0.99 < rep["desc_norm_mean"] < 1.01):
+                        print("    !! WARNING: descriptor norms != 1.0.")
+                    if rep["resp_absmean"] < 1e-6:
+                        print("    !! WARNING: Gabor responses ~0.")
+                    print()
+
+            # ─── Combine task losses ───
+            if task_weighter is not None:
+                terms = [loss_jepa]
+                if l_a1 is not None:
+                    terms.append(l_a1)
+                if l_a2 is not None:
+                    terms.append(l_a2)
+                loss = task_weighter(terms)
+            else:
+                if l_a1 is not None:
+                    loss = loss + args.w_a1 * l_a1
+                if l_a2 is not None:
+                    loss = loss + args.w_a2 * l_a2
+
+            # ─── Gradient-conflict diagnostic on shared params ───
+            # >0 complementary, ~0 orthogonal, <0 conflicting.
+            if (use_struct and args.log_conflict and n_batches == 0
+                    and ((epoch + 1) % args.gabor_log_every == 0 or epoch == start_epoch)):
+                l_struct_tot = 0.0
+                if l_a1 is not None:
+                    l_struct_tot = l_struct_tot + l_a1
+                if l_a2 is not None:
+                    l_struct_tot = l_struct_tot + l_a2
+                ep_conflict = grad_conflict_cosine(
+                    loss_jepa, l_struct_tot,
+                    list(context_encoder.norm.parameters()))
 
             _new_lr = lr_scheduler.step()
             _new_wd = wd_scheduler.step()
@@ -334,7 +442,7 @@ def Train(
             MyUtils.update_ema(context_encoder, target_encoder, momentum=momentum)
 
             global_step += 1
-            epoch_loss += loss.item()
+            epoch_loss += loss_jepa.item()
             n_batches += 1
             pbar.set_postfix(
                 loss=f"{epoch_loss / n_batches:.4f}",
@@ -351,12 +459,31 @@ def Train(
             f"Epoch {epoch+1} | loss={epoch_loss:.4f} | feature_var={feat_var:.6f} "
             f"| visible-patch corrupt (blue/red/green/jitter/noise) | MSE(z_p, z_2)"
         )
+        if use_a1:
+            print(f"    A1 (visible): loss={ep_a1/max(n_a1,1):.4f}  "
+                  f"cos={ep_a1_cos/max(n_a1,1):.3f}  "
+                  f"top1={ep_a1_top1/max(n_a1,1):.3f}")
+        if use_a2:
+            print(f"    A2 (hidden):  loss={ep_a2/max(n_a2,1):.4f}  "
+                  f"cos={ep_a2_cos/max(n_a2,1):.3f}  "
+                  f"top1={ep_a2_top1/max(n_a2,1):.3f}")
+        if use_struct and args.log_conflict:
+            msg = f"    conflict_cos={ep_conflict:+.4f}"
+            if task_weighter is not None:
+                ws = "  ".join(f"{w:.3f}" for w in task_weighter.weights())
+                msg += f"   learned_w=[{ws}]"
+            print(msg)
 
         models = {
             "context": context_encoder,
             "target": target_encoder,
             "predictor": predictor,
         }
+        if use_struct:
+            models["struct_head"] = struct_head
+            if task_weighter is not None:
+                models["task_weighter"] = task_weighter
+
         eval_history, best_acc = periodic_eval.maybe_eval_epoch(
             epoch, context_encoder, args, eval_history, _extract_eval_features,
             best_acc=best_acc,
