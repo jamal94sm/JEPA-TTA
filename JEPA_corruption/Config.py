@@ -59,7 +59,7 @@ def get_arguments():
                          help="[mixed mode only] per-type inclusion probability. "
                               "Each corrupted sample independently includes each corruption "
                               "type with this probability (at least one is forced in).")
-    
+
     # --- per-corruption severity (each is a *maximum*; actual severity for an "
     #     applied" sample is drawn U(0, max) independently, so severity varies too) ---
     parser.add_argument('--color_temp_strength',     type=float, default=0.25,   # illumination/white-balance shift
@@ -77,4 +77,44 @@ def get_arguments():
     parser.add_argument('--vignette_strength',       type=float, default=0.3,    # optics/acquisition geometry
                          help="Max radial darkening at image corners.")
 
-    return parser.parse_args()
+    # ─── Gabor structural tasks (A1 = visible patches, A2 = hidden patches) ──
+    parser.add_argument('--struct_mode',        type=str,   default='none',
+                         choices=['none', 'a1', 'a2', 'both'],
+                         help="a1 = structure on visible patches (via context_embeddings). "
+                              "a2 = structure on hidden patches (via predictor). "
+                              "both = A1+A2 sharing one structure head.")
+    parser.add_argument('--w_a1',               type=float, default=0.3)
+    parser.add_argument('--w_a2',               type=float, default=0.3)
+    parser.add_argument('--struct_head_hidden', type=int,   default=128)
+
+    parser.add_argument('--struct_loss',        type=str,   default='cosine',
+                         choices=['cosine', 'infonce', 'smooth_l1'],
+                         help="Default structural loss for both tasks.")
+    parser.add_argument('--struct_loss_a1',     type=str,   default=None,
+                         choices=['cosine', 'infonce', 'smooth_l1'],
+                         help="Override --struct_loss for the A1 (visible) task.")
+    parser.add_argument('--struct_loss_a2',     type=str,   default=None,
+                         choices=['cosine', 'infonce', 'smooth_l1'],
+                         help="Override --struct_loss for the A2 (hidden) task.")
+    parser.add_argument('--infonce_temp',       type=float, default=0.1)
+    parser.add_argument('--infonce_max_n',      type=int,   default=4096)
+
+    parser.add_argument('--task_weighting',     type=str,   default='fixed',
+                         choices=['fixed', 'uncertainty'])
+
+    parser.add_argument('--gabor_orient',       type=int,   default=8)
+    parser.add_argument('--gabor_gray',         type=int,   default=0, choices=[0, 1],
+                         help="1 = collapse to grayscale. 0 = per-channel Gabor "
+                              "(correct default here — STL/CIFAR/Tiny-ImageNet are RGB, "
+                              "unlike CASIA-MS).")
+    parser.add_argument('--gabor_log_every',    type=int,   default=5,
+                         help="Print structural/diagnostic logs every N epochs.")
+    parser.add_argument('--log_conflict',       type=int,   default=1, choices=[0, 1],
+                         help="Log cosine between task gradients on shared params.")
+
+    args = parser.parse_args()
+    args.use_a1 = args.struct_mode in ('a1', 'both')
+    args.use_a2 = args.struct_mode in ('a2', 'both')
+    args.loss_a1 = args.struct_loss_a1 or args.struct_loss
+    args.loss_a2 = args.struct_loss_a2 or args.struct_loss
+    return args
