@@ -118,14 +118,25 @@ def get_cfg(args=None):
                    choices=["none", "a1", "a2", "both"],
                    help="a1 = structure on visible patches (via ctx_embeds). "
                         "a2 = structure on hidden patches (via predictor). "
-                        "both = A1+A2 sharing one structure head.")
+                        "both = A1+A2 sharing (or not, see struct_head_mode) "
+                        "one structure head.")
     p.add_argument("--w_a1", type=float, default=0.3)
     p.add_argument("--w_a2", type=float, default=0.3)
     p.add_argument("--struct_head_hidden", type=int, default=128)
     p.add_argument("--struct_head_mode", default="shared",
-               choices=["shared", "separate"])
-    
-    # ─── Structural loss form ─────────────────────────────────
+                   choices=["shared", "separate"],
+                   help="shared = one StructureHead for A1 and A2. "
+                        "separate = independent heads (only differs from "
+                        "'shared' when --struct_mode both).")
+    p.add_argument("--norm_struct_out", type=int, default=1, choices=[0, 1],
+                   help="LayerNorm on the predictor's structure output "
+                        "(out_proj_struct) so its distribution matches "
+                        "ctx_embeds. Matters most when struct_head_mode=shared, "
+                        "since an unnormalized A2 output otherwise feeds the "
+                        "shared head a differently-scaled input than A1's "
+                        "ctx_embeds. Changes the architecture: pass "
+                        "--norm_struct_out 0 to reproduce earlier checkpoints.")
+
     # ─── Structural loss form ─────────────────────────────────
     p.add_argument("--struct_loss", default="cosine",
                    choices=["cosine", "infonce", "smooth_l1"],
@@ -162,6 +173,6 @@ def get_cfg(args=None):
         cfg.w_a1 = cfg.gabor_weight
     cfg.use_a1 = cfg.struct_mode in ("a1", "both")
     cfg.use_a2 = cfg.struct_mode in ("a2", "both")
-    cfg.loss_a1 = cfg.struct_loss_a1 or cfg.struct_loss      # NEW
-    cfg.loss_a2 = cfg.struct_loss_a2 or cfg.struct_loss      # NEW
+    cfg.loss_a1 = cfg.struct_loss_a1 or cfg.struct_loss
+    cfg.loss_a2 = cfg.struct_loss_a2 or cfg.struct_loss
     return cfg
