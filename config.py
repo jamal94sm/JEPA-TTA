@@ -124,8 +124,16 @@ def get_cfg(args=None):
     p.add_argument("--struct_head_hidden", type=int, default=128)
 
     # ─── Structural loss form ─────────────────────────────────
+    # ─── Structural loss form ─────────────────────────────────
     p.add_argument("--struct_loss", default="cosine",
-                   choices=["cosine", "infonce", "smooth_l1"])
+                   choices=["cosine", "infonce", "smooth_l1"],
+                   help="Default structural loss for both tasks.")
+    p.add_argument("--struct_loss_a1", default=None,
+                   choices=["cosine", "infonce", "smooth_l1"],
+                   help="Override --struct_loss for the A1 (visible) task.")
+    p.add_argument("--struct_loss_a2", default=None,
+                   choices=["cosine", "infonce", "smooth_l1"],
+                   help="Override --struct_loss for the A2 (hidden) task.")
     p.add_argument("--infonce_temp", type=float, default=0.1)
     p.add_argument("--infonce_max_n", type=int, default=4096)
 
@@ -152,4 +160,6 @@ def get_cfg(args=None):
         cfg.w_a1 = cfg.gabor_weight
     cfg.use_a1 = cfg.struct_mode in ("a1", "both")
     cfg.use_a2 = cfg.struct_mode in ("a2", "both")
+    cfg.loss_a1 = cfg.struct_loss_a1 or cfg.struct_loss      # NEW
+    cfg.loss_a2 = cfg.struct_loss_a2 or cfg.struct_loss      # NEW
     return cfg
