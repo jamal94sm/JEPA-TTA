@@ -174,9 +174,10 @@ def train_jepa(cfg, train_loader, eval_dict, id_map, n_classes):
         print(f"  Structure head: {n_sh/1e6:.3f}M params "
               f"(hidden={cfg.struct_head_hidden} -> {gabor_bank.K})")
         print(f"  Struct mode: {cfg.struct_mode}   "
-              f"loss_a1={cfg.loss_a1}  loss_a2={cfg.loss_a2}   "
+              f"loss_a1={cfg.loss_a1 if use_a1 else '—'}  "
+              f"loss_a2={cfg.loss_a2 if use_a2 else '—'}   "
               f"weighting={cfg.task_weighting}   "
-              f"w_a1={cfg.w_a1}  w_a2={cfg.w_a2}")
+              f"w_a1={cfg.w_a1 if use_a1 else '—'}  w_a2={cfg.w_a2 if use_a2 else '—'}")
 
     print(f"  Corruption: {'ON' if getattr(cfg, 'use_corruption', 0) else 'OFF'}"
           f"   Structural: {'ON' if use_struct else 'OFF'}")
