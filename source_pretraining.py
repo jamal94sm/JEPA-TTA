@@ -756,27 +756,38 @@ def train_vit_sup(cfg, train_loader, eval_dict, id_map, n_train_ids, train_id_ma
 #  History / footer printers
 # ══════════════════════════════════════════════════════════════
 
-def _print_history_jepa(eval_history, eval_dict, use_gabor=False):
+def _print_history_jepa(eval_history, eval_dict, use_a1=False, use_a2=False):
     eval_names = list(eval_dict.keys())
-    if use_gabor:
-        print(f"\n  {'Epoch':>6} {'Loss':>8} {'Sim':>6} {'l_gab':>7} {'gcos':>6}", end="")
-    else:
-        print(f"\n  {'Epoch':>6} {'Loss':>8} {'Sim':>6}", end="")
+
+    print(f"\n  {'Epoch':>6} {'Loss':>8} {'Sim':>6}", end="")
+    if use_a1:
+        print(f" {'l_a1':>7} {'a1cos':>6} {'a1top1':>7}", end="")
+    if use_a2:
+        print(f" {'l_a2':>7} {'a2cos':>6} {'a2top1':>7}", end="")
     for name in eval_names:
         print(f" │ {name[:12]:>12} R1   EER", end="")
     print()
+
     print(f"  {'─'*8}{'─'*8}{'─'*6}", end="")
-    if use_gabor:
-        print(f"{'─'*7}{'─'*6}", end="")
+    if use_a1:
+        print(f"{'─'*7}{'─'*6}{'─'*7}", end="")
+    if use_a2:
+        print(f"{'─'*7}{'─'*6}{'─'*7}", end="")
     for _ in eval_names:
         print(f"─┼─{'─'*24}", end="")
     print()
+
     for entry in eval_history:
         print(f"  {entry['epoch']:>6} {entry['loss']:>8.4f} "
               f"{entry['sim']:>6.3f}", end="")
-        if use_gabor:
-            print(f" {entry.get('l_gab', float('nan')):>7.4f} "
-                  f"{entry.get('gabor_cos', float('nan')):>6.3f}", end="")
+        if use_a1:
+            print(f" {entry.get('l_a1', float('nan')):>7.4f} "
+                  f"{entry.get('a1_cos', float('nan')):>6.3f} "
+                  f"{entry.get('a1_top1', float('nan')):>7.3f}", end="")
+        if use_a2:
+            print(f" {entry.get('l_a2', float('nan')):>7.4f} "
+                  f"{entry.get('a2_cos', float('nan')):>6.3f} "
+                  f"{entry.get('a2_top1', float('nan')):>7.3f}", end="")
         for name in eval_names:
             if name in entry:
                 r = entry[name]
