@@ -135,7 +135,8 @@ def train_jepa(cfg, train_loader, eval_dict, id_map, n_classes):
     target_encoder = TargetEncoder(
         img_size, cfg.num_patches, cfg.embed_dim).to(cfg.device)
     predictor = Predictor(
-        cfg.num_patches, cfg.embed_dim).to(cfg.device)
+        cfg.num_patches, cfg.embed_dim,
+        norm_struct_out=bool(cfg.norm_struct_out)).to(cfg.device)
 
     for pc, pt in zip(context_encoder.parameters(),
                       target_encoder.parameters()):
@@ -152,7 +153,7 @@ def train_jepa(cfg, train_loader, eval_dict, id_map, n_classes):
     use_a1 = bool(getattr(cfg, "use_a1", False))
     use_a2 = bool(getattr(cfg, "use_a2", False))
     use_struct = use_a1 or use_a2
-    gabor_bank = struct_head = task_weighter = None
+    gabor_bank = struct_head = struct_head_a2 = task_weighter = None
 
     if use_struct:
         gabor_bank = GaborBank(
@@ -162,17 +163,31 @@ def train_jepa(cfg, train_loader, eval_dict, id_map, n_classes):
         struct_head = StructureHead(
             cfg.embed_dim, gabor_bank.K,
             hidden=cfg.struct_head_hidden).to(cfg.device)
+
+        # Separate head only means anything when BOTH tasks are active.
+        if cfg.struct_head_mode == "separate" and use_a1 and use_a2:
+            struct_head_a2 = StructureHead(
+                cfg.embed_dim, gabor_bank.K,
+                hidden=cfg.struct_head_hidden).to(cfg.device)
+        else:
+            struct_head_a2 = struct_head          # alias -> shared behaviour
+
         n_sh = sum(p.numel() for p in struct_head.parameters())
+        if struct_head_a2 is not struct_head:
+            n_sh += sum(p.numel() for p in struct_head_a2.parameters())
 
         n_tasks = 1 + int(use_a1) + int(use_a2)
         if cfg.task_weighting == "uncertainty":
             task_weighter = UncertaintyWeighting(n_tasks).to(cfg.device)
 
         mode = "per-channel RGB" if gabor_bank.per_channel else "grayscale"
+        head_mode = ("separate" if struct_head_a2 is not struct_head
+                     else "shared")
         print(f"  Gabor bank: K={gabor_bank.K} "
               f"({cfg.gabor_orient} orient x {gabor_bank.n_scales} scales, {mode})")
-        print(f"  Structure head: {n_sh/1e6:.3f}M params "
-              f"(hidden={cfg.struct_head_hidden} -> {gabor_bank.K})")
+        print(f"  Structure head: {n_sh/1e6:.3f}M params  "
+              f"(hidden={cfg.struct_head_hidden} -> {gabor_bank.K}, {head_mode})")
+        print(f"  Struct out norm: {'ON' if cfg.norm_struct_out else 'OFF'}")
         print(f"  Struct mode: {cfg.struct_mode}   "
               f"loss_a1={cfg.loss_a1 if use_a1 else '—'}  "
               f"loss_a2={cfg.loss_a2 if use_a2 else '—'}   "
@@ -185,6 +200,8 @@ def train_jepa(cfg, train_loader, eval_dict, id_map, n_classes):
     train_params = list(context_encoder.parameters()) + list(predictor.parameters())
     if use_struct:
         train_params += list(struct_head.parameters())
+        if struct_head_a2 is not struct_head:      # avoid double-registering
+            train_params += list(struct_head_a2.parameters())
     if task_weighter is not None:
         train_params += list(task_weighter.parameters())
     opt = torch.optim.AdamW(train_params, lr=cfg.learning_rate,
@@ -212,6 +229,8 @@ def train_jepa(cfg, train_loader, eval_dict, id_map, n_classes):
         target_encoder.eval()
         if use_struct:
             struct_head.train()
+            if struct_head_a2 is not struct_head:
+                struct_head_a2.train()
 
         ep_loss = 0.0          # raw JEPA term only — comparable across runs
         ep_var = 0.0
@@ -288,7 +307,7 @@ def train_jepa(cfg, train_loader, eval_dict, id_map, n_classes):
                             f"A2 misalignment: t_a2 {tuple(t_a2.shape)} vs "
                             f"struct_hidden {tuple(struct_hidden.shape)}")
                     l_a2, s_a2 = structure_loss(
-                        struct_head(struct_hidden), t_a2,
+                        struct_head_a2(struct_hidden), t_a2,
                         kind=cfg.loss_a2,
                         temperature=cfg.infonce_temp,
                         max_n=cfg.infonce_max_n)
@@ -433,8 +452,12 @@ def train_jepa(cfg, train_loader, eval_dict, id_map, n_classes):
                 }
                 if use_struct:
                     ckpt["struct_head"] = struct_head.state_dict()
+                    if struct_head_a2 is not struct_head:
+                        ckpt["struct_head_a2"] = struct_head_a2.state_dict()
                     ckpt["struct_cfg"] = {
                         "struct_mode": cfg.struct_mode,
+                        "struct_head_mode": cfg.struct_head_mode,
+                        "norm_struct_out": int(cfg.norm_struct_out),
                         "loss_a1": cfg.loss_a1,
                         "loss_a2": cfg.loss_a2,
                         "w_a1": cfg.w_a1, "w_a2": cfg.w_a2,
@@ -468,7 +491,10 @@ def train_jepa(cfg, train_loader, eval_dict, id_map, n_classes):
                 "aug_multiplier": cfg.aug_multiplier,
                 "use_corruption": int(getattr(cfg, "use_corruption", 0)),
                 "struct_mode": cfg.struct_mode,
-                "struct_loss": cfg.struct_loss,
+                "loss_a1": cfg.loss_a1,
+                "loss_a2": cfg.loss_a2,
+                "struct_head_mode": cfg.struct_head_mode,
+                "norm_struct_out": int(cfg.norm_struct_out),
                 "w_a1": float(cfg.w_a1),
                 "w_a2": float(cfg.w_a2),
                 "struct_head_hidden": int(cfg.struct_head_hidden),
@@ -480,7 +506,6 @@ def train_jepa(cfg, train_loader, eval_dict, id_map, n_classes):
             "best": best_eval, "history": eval_history,
         }, f, indent=2)
     print(f"\n  Saved: {save_path}")
-
 
 def _print_history_jepa(eval_history, eval_dict, use_a1=False, use_a2=False):
     eval_names = list(eval_dict.keys())
