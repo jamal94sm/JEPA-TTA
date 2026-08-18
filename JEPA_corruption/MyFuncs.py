@@ -320,7 +320,10 @@ def Train(
                 device=device,
             )
 
-            images_ctx = corrupt_visible_patches(images, context_masks, args)
+            if getattr(args, "use_corruption", 1):
+                images_ctx = corrupt_visible_patches(images, context_masks, args)
+            else:
+                images_ctx = images
             context_embeddings = context_encoder(images_ctx, context_masks)
 
             with torch.no_grad():
