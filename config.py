@@ -97,6 +97,14 @@ def get_cfg(args=None):
                         "0 = per-channel Gabor (RGB datasets, e.g. XJTU).")
     p.add_argument("--gabor_log_every", type=int, default=5,
                    help="Print structural/diagnostic logs every N epochs.")
+    p.add_argument('--gabor_scales', type=str,
+                     default='[[5,1.5,3.0],[9,3.0,6.0],[13,4.5,9.0]]',
+                     help="JSON list of [kernel_size, sigma, lambda] triples "
+                          "for the Gabor bank. Old default was "
+                          "[[9,3,6],[15,5,10],[21,7,14]] -- that version "
+                          "let filters bleed across patch boundaries; the "
+                          "new default keeps max kernel size (13) below "
+                          "typical patch size to stay patch-local.")
 
     # ─── Legacy A1 aliases (deprecated; prefer --struct_mode) ──
     p.add_argument("--use_gabor", type=int, default=0, choices=[0, 1],
