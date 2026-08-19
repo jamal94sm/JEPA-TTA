@@ -47,6 +47,7 @@ def run(dataset, args):
     if use_struct:
         gabor_bank = GaborBank(
             n_orient=args.gabor_orient,
+            scales=args.gabor_scales,                          # NEW
             per_channel=not bool(args.gabor_gray),
         ).to(args.device)
         struct_head = MyModels.StructureHead(
