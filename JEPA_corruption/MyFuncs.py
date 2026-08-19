@@ -360,6 +360,12 @@ def Train(
                 images_ctx = images
             context_embeddings = context_encoder(images_ctx, context_masks)
 
+            if epoch == start_epoch and n_batches == 0:
+                identical = torch.equal(images_ctx, images)
+                print(f"[sanity] use_corruption={getattr(args,'use_corruption',1)}  "
+                      f"images_ctx == images: {identical}  "
+                      f"max|diff|={ (images_ctx - images).abs().max().item():.4f}")
+            
             with torch.no_grad():
                 z = context_embeddings.reshape(-1, context_embeddings.size(-1))
                 if z.size(0) > 0:
