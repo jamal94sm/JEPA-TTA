@@ -500,7 +500,9 @@ def Train(
         feat_var = epoch_var_sum / max(epoch_var_count, 1)
         print(
             f"Epoch {epoch+1} | loss={epoch_loss:.4f} | feature_var={feat_var:.6f} "
-            f"| visible-patch corrupt (blue/red/green/jitter/noise) | MSE(z_p, z_2)"
+            f"| corruption={'ON' if getattr(args,'use_corruption',1) else 'OFF'} "
+            f"| struct={'ON' if use_struct else 'OFF'} "
+            f"| MSE(z_p, z_2)"
         )
         if use_a1:
             print(f"    A1 (visible): loss={ep_a1/max(n_a1,1):.4f}  "
