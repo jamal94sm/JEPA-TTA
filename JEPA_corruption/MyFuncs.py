@@ -286,6 +286,40 @@ def Train(
     use_a2 = struct_head is not None and bool(getattr(args, "use_a2", False))
     use_struct = use_a1 or use_a2
 
+
+    # ─── Startup summary — mirrors source_pretraining.py's transparency ───
+    n_ctx = sum(p.numel() for p in context_encoder.parameters())
+    n_tgt = sum(p.numel() for p in target_encoder.parameters())
+    n_pred = sum(p.numel() for p in predictor.parameters())
+    print(f"\n{'='*70}")
+    print(f"  TRAINING SETUP")
+    print(f"{'='*70}")
+    print(f"  Context encoder: {n_ctx/1e6:.2f}M params (trainable)")
+    print(f"  Target encoder:  {n_tgt/1e6:.2f}M params (EMA, frozen)")
+    print(f"  Predictor:       {n_pred/1e6:.2f}M params")
+    print(f"  Corruption: {'ON' if getattr(args, 'use_corruption', 1) else 'OFF'}", end="")
+    if getattr(args, "use_corruption", 1):
+        print(f"  (prob={args.corruption_prob}, mode={args.corruption_mode})")
+    else:
+        print()
+    print(f"  Structural (Gabor): {'ON' if use_struct else 'OFF'}", end="")
+    if use_struct:
+        n_sh = sum(p.numel() for p in struct_head.parameters())
+        mode = getattr(args, "struct_mode", "?")
+        print(f"  (mode={mode}, A1={'on' if use_a1 else 'off'}, "
+              f"A2={'on' if use_a2 else 'off'}, "
+              f"gabor_bank K={gabor_bank.K}, head={n_sh/1e6:.3f}M params)")
+        print(f"    w_a1={getattr(args,'w_a1','—') if use_a1 else '—'}  "
+              f"w_a2={getattr(args,'w_a2','—') if use_a2 else '—'}  "
+              f"loss_a1={getattr(args,'loss_a1','—') if use_a1 else '—'}  "
+              f"loss_a2={getattr(args,'loss_a2','—') if use_a2 else '—'}  "
+              f"weighting={getattr(args,'task_weighting','fixed')}")
+    else:
+        print()
+    print(f"{'='*70}\n")
+
+    
+
     for _ in range(global_step):
         lr_scheduler.step()
         wd_scheduler.step()
