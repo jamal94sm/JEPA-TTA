@@ -11,10 +11,12 @@ produces [B, embed_dim] features — so all downstream subspace tooling works
 unchanged. Point --output_dir somewhere method-specific so checkpoints do not
 collide (e.g. ./output_jepa vs ./output_compnet).
 
-JEPA add-ons (both default OFF, so --use_corruption 0 --use_gabor 0 reproduces
-the original baseline exactly):
-  --use_corruption 1 : domain-shift corruption applied to the CONTEXT view only
-  --use_gabor 1      : Gabor line-structure auxiliary loss (design A1)
+JEPA add-ons (all default OFF, so the plain flags reproduce the original
+baseline exactly):
+  --use_corruption 1  : domain-shift corruption applied to the CONTEXT view only
+  --struct_mode a1/a2/both : Gabor line-structure auxiliary loss(es)
+  --use_supervision 1 : supervised identity term (SupCon / ArcFace / CE) on
+                        pooled context embeddings, using source-domain labels
 
 
 python source_pretraining.py --method compnet --data_dir /home/pai-ng/Jamal/CASIA-MS-ROI --mode cross_domain_openset --train_spectrums WHT --output_dir ./output_compnet
@@ -29,8 +31,15 @@ nohup python source_pretraining.py --method vit_sup \
 nohup python source_pretraining.py --method jepa \
   --data_dir /home/pai-ng/Jamal/CASIA-MS-ROI \
   --mode cross_domain_openset --train_spectrums WHT \
-  --use_gabor 1 --gabor_weight 0.3 \
+  --struct_mode a1 --w_a1 0.3 \
   --output_dir ./output_jepa_gabor > JepaGabor.log 2>&1 &
+
+nohup python source_pretraining.py --method jepa \
+  --data_dir /home/pai-ng/Jamal/XJTU-UP \
+  --mode cross_domain_openset --train_spectrums iPhone_Nature \
+  --use_corruption 1 --gabor_gray 0 --struct_mode a2 --struct_loss infonce --w_a2 0.3 \
+  --use_supervision 1 --sup_loss supcon --w_sup 0.1 --batch_size 256 \
+  --output_dir ./output_jepa_a2_supcon > JepaA2Supcon.log 2>&1 &
 
 """
 
@@ -54,6 +63,7 @@ from evaluate import run_full_eval
 from corruption import corrupt_images
 from gabor import GaborBank, patch_energy_descriptor, sanity_report
 from struct_loss import structure_loss, grad_conflict_cosine
+from sup_loss import supcon_loss, build_sup_head
 
 CASIA_MEAN = [0.5, 0.5, 0.5]                    # matches dataset.py's Normalize()
 CASIA_STD  = [0.5, 0.5, 0.5]
@@ -78,7 +88,7 @@ def gabor_weight_at(epoch, cfg):
     if s == "ramp":
         return w0 * t
     raise ValueError(f"unknown gabor_schedule: {s}")
-  
+
 
 def set_seed(seed):
     random.seed(seed)
@@ -123,7 +133,7 @@ def make_scheduler(opt, cfg, total_steps):
 
 
 # ══════════════════════════════════════════════════════════════
-#  JEPA (self-supervised)
+#  JEPA (self-supervised, with optional structural + supervised terms)
 # ══════════════════════════════════════════════════════════════
 
 def train_jepa(cfg, train_loader, eval_dict, id_map, n_classes):
@@ -158,7 +168,7 @@ def train_jepa(cfg, train_loader, eval_dict, id_map, n_classes):
     if use_struct:
         gabor_bank = GaborBank(
             n_orient=cfg.gabor_orient,
-            scales=cfg.gabor_scales,                          # NEW
+            scales=cfg.gabor_scales,
             per_channel=not bool(getattr(cfg, "gabor_gray", 1)),
         ).to(cfg.device)
         struct_head = StructureHead(
@@ -177,10 +187,20 @@ def train_jepa(cfg, train_loader, eval_dict, id_map, n_classes):
         if struct_head_a2 is not struct_head:
             n_sh += sum(p.numel() for p in struct_head_a2.parameters())
 
-        n_tasks = 1 + int(use_a1) + int(use_a2)
+    # ─── Supervised identity term (uses source-domain labels) ─────
+    use_sup = bool(getattr(cfg, "use_supervision", 0)) and cfg.w_sup > 0
+    sup_head = None
+    if use_sup:
+        sup_head = build_sup_head(cfg.sup_loss, cfg.embed_dim, n_classes, cfg)
+        if sup_head is not None:
+            sup_head = sup_head.to(cfg.device)
+
+    n_tasks = 1 + int(use_a1) + int(use_a2) + int(use_sup)
+    if use_struct or use_sup:
         if cfg.task_weighting == "uncertainty":
             task_weighter = UncertaintyWeighting(n_tasks).to(cfg.device)
 
+    if use_struct:
         mode = "per-channel RGB" if gabor_bank.per_channel else "grayscale"
         head_mode = ("separate" if struct_head_a2 is not struct_head
                      else "shared")
@@ -195,14 +215,22 @@ def train_jepa(cfg, train_loader, eval_dict, id_map, n_classes):
               f"weighting={cfg.task_weighting}   "
               f"w_a1={cfg.w_a1 if use_a1 else '—'}  w_a2={cfg.w_a2 if use_a2 else '—'}")
 
+    if use_sup:
+        n_sp = sum(p.numel() for p in sup_head.parameters()) if sup_head else 0
+        print(f"  Supervision: {cfg.sup_loss}  w_sup={cfg.w_sup}  "
+              f"n_classes={n_classes}  head={n_sp/1e6:.3f}M params")
+
     print(f"  Corruption: {'ON' if getattr(cfg, 'use_corruption', 0) else 'OFF'}"
-          f"   Structural: {'ON' if use_struct else 'OFF'}")
+          f"   Structural: {'ON' if use_struct else 'OFF'}"
+          f"   Supervision: {'ON' if use_sup else 'OFF'}")
 
     train_params = list(context_encoder.parameters()) + list(predictor.parameters())
     if use_struct:
         train_params += list(struct_head.parameters())
         if struct_head_a2 is not struct_head:      # avoid double-registering
             train_params += list(struct_head_a2.parameters())
+    if sup_head is not None:
+        train_params += list(sup_head.parameters())
     if task_weighter is not None:
         train_params += list(task_weighter.parameters())
     opt = torch.optim.AdamW(train_params, lr=cfg.learning_rate,
@@ -232,18 +260,23 @@ def train_jepa(cfg, train_loader, eval_dict, id_map, n_classes):
             struct_head.train()
             if struct_head_a2 is not struct_head:
                 struct_head_a2.train()
+        if sup_head is not None:
+            sup_head.train()
 
         ep_loss = 0.0          # raw JEPA term only — comparable across runs
         ep_var = 0.0
         ep_a1 = ep_a1_cos = ep_a1_top1 = 0.0
         ep_a2 = ep_a2_cos = ep_a2_top1 = 0.0
         n_a1 = n_a2 = 0
+        ep_sup = ep_sup_aux = 0.0
+        n_sup = 0
         ep_conflict = float("nan")
         n_bat = 0
         t0 = time.time()
 
-        for images, _ in train_loader:
+        for images, labels in train_loader:
             images = images.to(cfg.device)
+            labels = labels.to(cfg.device)
             B = images.size(0)
 
             ctx_masks, tgt_masks = patchify(
@@ -331,6 +364,32 @@ def train_jepa(cfg, train_loader, eval_dict, id_map, n_classes):
                         print("      !! WARNING: Gabor responses ~0.")
                     print()
 
+            # ─── Supervised identity term ───
+            # Pooled the same way FeatureExtractor pools at eval time, but
+            # over the corrupted/visible context (a harder, related target).
+            l_sup = None
+            if use_sup:
+                z_sup = ctx_embeds.mean(dim=1)             # (B, embed_dim)
+                if cfg.sup_loss == "supcon":
+                    l_sup, s_sup = supcon_loss(
+                        z_sup, labels, temperature=cfg.supcon_temp)
+                else:
+                    l_sup, s_sup = sup_head(z_sup, labels)
+                ep_sup += l_sup.item()
+                ep_sup_aux += s_sup.get("acc", s_sup.get("pos_per_anchor", 0.0))
+                n_sup += 1
+
+                if epoch == 1 and n_bat == 0 and cfg.sup_loss == "supcon":
+                    print(f"\n  ── SupCon sanity check (epoch 1, batch 0) ──")
+                    print(f"      pos_per_anchor: {s_sup['pos_per_anchor']:.3f}")
+                    print(f"      frac_anchors_with_pos: "
+                          f"{s_sup['frac_anchors_with_pos']:.3f}")
+                    if s_sup["pos_per_anchor"] < 1.0:
+                        print("      !! WARNING: fewer than 1 positive/anchor "
+                              "on average — increase --batch_size or use a "
+                              "sampler that guarantees same-identity pairs.")
+                    print()
+
             # ─── Combine task losses ───
             if task_weighter is not None:
                 terms = [loss_jepa]
@@ -338,6 +397,8 @@ def train_jepa(cfg, train_loader, eval_dict, id_map, n_classes):
                     terms.append(l_a1)
                 if l_a2 is not None:
                     terms.append(l_a2)
+                if l_sup is not None:
+                    terms.append(l_sup)
                 loss = task_weighter(terms)
             else:
                 loss = loss_jepa
@@ -345,18 +406,22 @@ def train_jepa(cfg, train_loader, eval_dict, id_map, n_classes):
                     loss = loss + cfg.w_a1 * l_a1
                 if l_a2 is not None:
                     loss = loss + cfg.w_a2 * l_a2
+                if l_sup is not None:
+                    loss = loss + cfg.w_sup * l_sup
 
             # ─── Gradient-conflict diagnostic on shared params ───
             # >0 complementary, ~0 orthogonal, <0 conflicting.
-            if (use_struct and cfg.log_conflict and n_bat == 0
+            if ((use_struct or use_sup) and cfg.log_conflict and n_bat == 0
                     and (epoch % cfg.gabor_log_every == 0 or epoch == 1)):
-                l_struct_tot = 0.0
+                l_aux_tot = 0.0
                 if l_a1 is not None:
-                    l_struct_tot = l_struct_tot + l_a1
+                    l_aux_tot = l_aux_tot + l_a1
                 if l_a2 is not None:
-                    l_struct_tot = l_struct_tot + l_a2
+                    l_aux_tot = l_aux_tot + l_a2
+                if l_sup is not None:
+                    l_aux_tot = l_aux_tot + l_sup
                 ep_conflict = grad_conflict_cosine(
-                    loss_jepa, l_struct_tot,
+                    loss_jepa, l_aux_tot,
                     list(context_encoder.norm.parameters()))
 
             opt.zero_grad()
@@ -379,6 +444,8 @@ def train_jepa(cfg, train_loader, eval_dict, id_map, n_classes):
         ep_a2 /= max(n_a2, 1)
         ep_a2_cos /= max(n_a2, 1)
         ep_a2_top1 /= max(n_a2, 1)
+        ep_sup /= max(n_sup, 1)
+        ep_sup_aux /= max(n_sup, 1)
         elapsed = time.time() - t0
         lr_now = scheduler.get_last_lr()[0]
 
@@ -399,7 +466,11 @@ def train_jepa(cfg, train_loader, eval_dict, id_map, n_classes):
             if use_a2:
                 print(f"           A2 (hidden):  loss={ep_a2:.4f}  "
                       f"cos={ep_a2_cos:.3f}  top1={ep_a2_top1:.3f}")
-            if use_struct and cfg.log_conflict:
+            if use_sup:
+                aux = "acc" if cfg.sup_loss in ("arcface", "ce") else "pos/anchor"
+                print(f"           SUP ({cfg.sup_loss}): loss={ep_sup:.4f}  "
+                      f"{aux}={ep_sup_aux:.3f}")
+            if (use_struct or use_sup) and cfg.log_conflict:
                 msg = f"           conflict_cos={ep_conflict:+.4f}"
                 if task_weighter is not None:
                     ws = "  ".join(f"{w:.3f}" for w in task_weighter.weights())
@@ -423,7 +494,10 @@ def train_jepa(cfg, train_loader, eval_dict, id_map, n_classes):
                 eval_entry["l_a2"] = ep_a2
                 eval_entry["a2_cos"] = ep_a2_cos
                 eval_entry["a2_top1"] = ep_a2_top1
-            if use_struct:
+            if use_sup:
+                eval_entry["l_sup"] = ep_sup
+                eval_entry["sup_aux"] = ep_sup_aux
+            if use_struct or use_sup:
                 eval_entry["conflict_cos"] = ep_conflict
                 if task_weighter is not None:
                     eval_entry["learned_w"] = task_weighter.weights()
@@ -469,6 +543,14 @@ def train_jepa(cfg, train_loader, eval_dict, id_map, n_classes):
                     }
                     if task_weighter is not None:
                         ckpt["task_weighter"] = task_weighter.state_dict()
+                if sup_head is not None:
+                    ckpt["sup_head"] = sup_head.state_dict()
+                if use_sup:
+                    ckpt["sup_cfg"] = {
+                        "use_supervision": int(use_sup),
+                        "sup_loss": cfg.sup_loss,
+                        "w_sup": cfg.w_sup,
+                    }
                 torch.save(ckpt, ckpt_path)
                 print(f"    ★ New best R1={mean_r1:.2f}% "
                       f"EER={mean_eer:.2f}% → saved")
@@ -476,7 +558,7 @@ def train_jepa(cfg, train_loader, eval_dict, id_map, n_classes):
             print(f"    Summary: Mean R1={mean_r1:.2f}% | "
                   f"Mean EER={mean_eer:.2f}%\n")
 
-    _print_history_jepa(eval_history, eval_dict, use_a1, use_a2)
+    _print_history_jepa(eval_history, eval_dict, use_a1, use_a2, use_sup)
     _print_footer(cfg, best_eval)
 
     save_path = os.path.join(cfg.output_dir,
@@ -503,38 +585,55 @@ def train_jepa(cfg, train_loader, eval_dict, id_map, n_classes):
                 "infonce_temp": float(cfg.infonce_temp),
                 "gabor_orient": int(cfg.gabor_orient),
                 "gabor_gray": int(getattr(cfg, "gabor_gray", 1)),
+                "use_supervision": int(use_sup),
+                "sup_loss": cfg.sup_loss,
+                "w_sup": float(cfg.w_sup),
             },
             "best": best_eval, "history": eval_history,
         }, f, indent=2)
     print(f"\n  Saved: {save_path}")
 
-def _print_history_jepa(eval_history, eval_dict, use_a1=False, use_a2=False):
+
+def _print_history_jepa(eval_history, eval_dict, use_a1=False, use_a2=False,
+                         use_sup=False):
     eval_names = list(eval_dict.keys())
+
     print(f"\n  {'Epoch':>6} {'Loss':>8} {'Sim':>6}", end="")
     if use_a1:
-        print(f" {'l_a1':>7} {'a1cos':>6}", end="")
+        print(f" {'l_a1':>7} {'a1cos':>6} {'a1top1':>7}", end="")
     if use_a2:
-        print(f" {'l_a2':>7} {'a2cos':>6}", end="")
+        print(f" {'l_a2':>7} {'a2cos':>6} {'a2top1':>7}", end="")
+    if use_sup:
+        print(f" {'l_sup':>7} {'supaux':>7}", end="")
     for name in eval_names:
         print(f" │ {name[:12]:>12} R1   EER", end="")
     print()
+
     print(f"  {'─'*8}{'─'*8}{'─'*6}", end="")
     if use_a1:
-        print(f"{'─'*7}{'─'*6}", end="")
+        print(f"{'─'*7}{'─'*6}{'─'*7}", end="")
     if use_a2:
-        print(f"{'─'*7}{'─'*6}", end="")
+        print(f"{'─'*7}{'─'*6}{'─'*7}", end="")
+    if use_sup:
+        print(f"{'─'*7}{'─'*7}", end="")
     for _ in eval_names:
         print(f"─┼─{'─'*24}", end="")
     print()
+
     for entry in eval_history:
         print(f"  {entry['epoch']:>6} {entry['loss']:>8.4f} "
               f"{entry['sim']:>6.3f}", end="")
         if use_a1:
             print(f" {entry.get('l_a1', float('nan')):>7.4f} "
-                  f"{entry.get('a1_cos', float('nan')):>6.3f}", end="")
+                  f"{entry.get('a1_cos', float('nan')):>6.3f} "
+                  f"{entry.get('a1_top1', float('nan')):>7.3f}", end="")
         if use_a2:
             print(f" {entry.get('l_a2', float('nan')):>7.4f} "
-                  f"{entry.get('a2_cos', float('nan')):>6.3f}", end="")
+                  f"{entry.get('a2_cos', float('nan')):>6.3f} "
+                  f"{entry.get('a2_top1', float('nan')):>7.3f}", end="")
+        if use_sup:
+            print(f" {entry.get('l_sup', float('nan')):>7.4f} "
+                  f"{entry.get('sup_aux', float('nan')):>7.3f}", end="")
         for name in eval_names:
             if name in entry:
                 r = entry[name]
@@ -542,6 +641,7 @@ def _print_history_jepa(eval_history, eval_dict, use_a1=False, use_a2=False):
             else:
                 print(f" │ {'---':>6} {'---':>6}", end="")
         print()
+
 
 # ══════════════════════════════════════════════════════════════
 #  CompNet (supervised cross-entropy on training IDs)
@@ -782,49 +882,8 @@ def train_vit_sup(cfg, train_loader, eval_dict, id_map, n_train_ids, train_id_ma
 
 
 # ══════════════════════════════════════════════════════════════
-#  History / footer printers
+#  History / footer printers (CompNet / ViT-sup)
 # ══════════════════════════════════════════════════════════════
-
-def _print_history_jepa(eval_history, eval_dict, use_a1=False, use_a2=False):
-    eval_names = list(eval_dict.keys())
-
-    print(f"\n  {'Epoch':>6} {'Loss':>8} {'Sim':>6}", end="")
-    if use_a1:
-        print(f" {'l_a1':>7} {'a1cos':>6} {'a1top1':>7}", end="")
-    if use_a2:
-        print(f" {'l_a2':>7} {'a2cos':>6} {'a2top1':>7}", end="")
-    for name in eval_names:
-        print(f" │ {name[:12]:>12} R1   EER", end="")
-    print()
-
-    print(f"  {'─'*8}{'─'*8}{'─'*6}", end="")
-    if use_a1:
-        print(f"{'─'*7}{'─'*6}{'─'*7}", end="")
-    if use_a2:
-        print(f"{'─'*7}{'─'*6}{'─'*7}", end="")
-    for _ in eval_names:
-        print(f"─┼─{'─'*24}", end="")
-    print()
-
-    for entry in eval_history:
-        print(f"  {entry['epoch']:>6} {entry['loss']:>8.4f} "
-              f"{entry['sim']:>6.3f}", end="")
-        if use_a1:
-            print(f" {entry.get('l_a1', float('nan')):>7.4f} "
-                  f"{entry.get('a1_cos', float('nan')):>6.3f} "
-                  f"{entry.get('a1_top1', float('nan')):>7.3f}", end="")
-        if use_a2:
-            print(f" {entry.get('l_a2', float('nan')):>7.4f} "
-                  f"{entry.get('a2_cos', float('nan')):>6.3f} "
-                  f"{entry.get('a2_top1', float('nan')):>7.3f}", end="")
-        for name in eval_names:
-            if name in entry:
-                r = entry[name]
-                print(f" │ {r['rank1']:>6.2f} {r['eer']:>6.2f}", end="")
-            else:
-                print(f" │ {'---':>6} {'---':>6}", end="")
-        print()
-
 
 def _print_history_compnet(eval_history, eval_dict):
     eval_names = list(eval_dict.keys())
