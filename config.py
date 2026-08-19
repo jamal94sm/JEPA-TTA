@@ -169,6 +169,24 @@ def get_cfg(args=None):
     p.add_argument("--log_conflict", type=int, default=1, choices=[0, 1],
                    help="Log cosine between task gradients on shared params.")
 
+    # ─── Supervised identity term (uses source-domain labels) ──
+    p.add_argument("--use_supervision", type=int, default=0, choices=[0, 1],
+                   help="1 = add a supervised identity loss on pooled "
+                        "context embeddings. Makes the method semi-supervised.")
+    p.add_argument("--sup_loss", default="supcon",
+                   choices=["supcon", "arcface", "ce"],
+                   help="supcon = prototype-free metric loss (generalizes to "
+                        "unseen IDs). arcface = angular-margin softmax. "
+                        "ce = plain cross-entropy (closed-set baseline arm).")
+    p.add_argument("--w_sup", type=float, default=0.1,
+                   help="Weight of the supervised term. Keep small (0.05-0.2) "
+                        "or the method becomes supervised with a JEPA regulariser.")
+    p.add_argument("--supcon_temp", type=float, default=0.1)
+    p.add_argument("--arcface_scale", type=float, default=30.0)
+    p.add_argument("--arcface_margin", type=float, default=0.5)
+
+
+    
     # ─── Misc ─────────────────────────────────────────────────
     p.add_argument("--seed", type=int, default=2025)
     p.add_argument("--device", default="cuda")
