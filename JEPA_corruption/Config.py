@@ -1,4 +1,5 @@
 import argparse
+import json
 import torch
 
 
@@ -47,7 +48,6 @@ def get_arguments():
     parser.add_argument('--final_weight_decay',        type=float, default=0.1)
 
     # --- corruption gating ---
-    parser.add_argument('--use_corruption', type=int, default=1, choices=[0, 1])
     parser.add_argument('--corruption_prob',        type=float, default=0.5,
                          help="Per-sample probability of being corrupted at all. "
                               "Expected #corrupted per batch = corruption_prob * batch_size, "
@@ -108,6 +108,17 @@ def get_arguments():
                          help="1 = collapse to grayscale. 0 = per-channel Gabor "
                               "(correct default here — STL/CIFAR/Tiny-ImageNet are RGB, "
                               "unlike CASIA-MS).")
+    parser.add_argument('--gabor_scales',       type=str,
+                         default='[[5,1.5,3.0],[9,3.0,6.0],[13,4.5,9.0]]',
+                         help="JSON list of [kernel_size, sigma, lambda] triples "
+                              "for the Gabor bank. Old default was "
+                              "[[9,3,6],[15,5,10],[21,7,14]] -- that version "
+                              "let filters bleed across patch boundaries; the "
+                              "new default keeps max kernel size (13) below "
+                              "the patch size (image_size/num_patches, 16px "
+                              "for the stl10/tiny-imagenet defaults) to stay "
+                              "patch-local. Re-derive the cap if you change "
+                              "--image_size or --num_patches.")
     parser.add_argument('--gabor_log_every',    type=int,   default=5,
                          help="Print structural/diagnostic logs every N epochs.")
     parser.add_argument('--log_conflict',       type=int,   default=1, choices=[0, 1],
@@ -118,4 +129,9 @@ def get_arguments():
     args.use_a2 = args.struct_mode in ('a2', 'both')
     args.loss_a1 = args.struct_loss_a1 or args.struct_loss
     args.loss_a2 = args.struct_loss_a2 or args.struct_loss
+
+    # --gabor_scales arrives as a JSON string (argparse can't take nested
+    # tuples directly) -- parse into the tuple-of-tuples GaborBank expects.
+    args.gabor_scales = tuple(tuple(s) for s in json.loads(args.gabor_scales))
+
     return args
