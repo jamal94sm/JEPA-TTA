@@ -158,6 +158,7 @@ def train_jepa(cfg, train_loader, eval_dict, id_map, n_classes):
     if use_struct:
         gabor_bank = GaborBank(
             n_orient=cfg.gabor_orient,
+            scales=cfg.gabor_scales,                          # NEW
             per_channel=not bool(getattr(cfg, "gabor_gray", 1)),
         ).to(cfg.device)
         struct_head = StructureHead(
