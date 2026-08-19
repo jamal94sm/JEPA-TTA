@@ -23,7 +23,7 @@ def gabor_kernel(ksize, sigma, lambd, theta, gamma=0.5, psi=0.0):
 
 class GaborBank(nn.Module):
     def __init__(self, n_orient=8,
-                 scales=((9, 3.0, 6.0), (15, 5.0, 10.0), (21, 7.0, 14.0)),
+                 scales=((5, 1.5, 3.0), (9, 3.0, 6.0), (13, 4.5, 9.0)),  # was: ((9,3,6),(15,5,10),(21,7,14))
                  gamma=0.5, per_channel=False):
         super().__init__()
         self.n_orient = n_orient
