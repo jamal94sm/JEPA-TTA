@@ -48,6 +48,7 @@ def get_arguments():
     parser.add_argument('--final_weight_decay',        type=float, default=0.1)
 
     # --- corruption gating ---
+    parser.add_argument('--use_corruption', type=int, default=1, choices=[0, 1])
     parser.add_argument('--corruption_prob',        type=float, default=0.5,
                          help="Per-sample probability of being corrupted at all. "
                               "Expected #corrupted per batch = corruption_prob * batch_size, "
