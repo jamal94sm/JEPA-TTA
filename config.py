@@ -194,6 +194,18 @@ def get_cfg(args=None):
     p.add_argument("--arcface_margin", type=float, default=0.5)
 
 
+    # ─── Structural target front-end (Gabor vs. HOG) ──────────
+    p.add_argument("--struct_target", default="gabor", choices=["gabor", "hog"],
+                   help="Which fixed descriptor produces the structural target. "
+                        "hog = MaskFeat-style gradient orientation histograms; "
+                        "gabor = multi-orientation/scale filter energy. Both "
+                        "get per-patch L2 normalization downstream.")
+    p.add_argument("--hog_bins", type=int, default=9,
+                   help="Orientation bins (9 is classic HOG / MaskFeat; use 8 "
+                        "to match --gabor_orient 8 for equal descriptor width).")
+    p.add_argument("--hog_sigmas", type=str, default="[0.0,1.0,2.0]",
+                   help="JSON list of pre-blur sigmas, one per scale. 0.0 = no "
+                        "blur. Length sets the number of HOG scales.")
     
     # ─── Misc ─────────────────────────────────────────────────
     p.add_argument("--seed", type=int, default=2025)
@@ -216,5 +228,6 @@ def get_cfg(args=None):
     # --gabor_scales arrives as a JSON string (argparse can't take nested
     # tuples directly) -- parse into the tuple-of-tuples GaborBank expects.
     cfg.gabor_scales = tuple(tuple(s) for s in json.loads(cfg.gabor_scales))
+    cfg.hog_sigmas = tuple(json.loads(cfg.hog_sigmas))
 
     return cfg
