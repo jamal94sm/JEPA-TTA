@@ -92,7 +92,6 @@ def get_cfg(args=None):
     p.add_argument("--vignette_strength", type=float, default=0.05)
 
     # ─── Gabor filter bank (shared by A1 and A2) ──────────────
-    p.add_argument("--gabor_orient", type=int, default=8)
     p.add_argument("--gabor_gray", type=int, default=1, choices=[0, 1],
                    help="1 = collapse to grayscale (correct for CASIA). "
                         "0 = per-channel Gabor (RGB datasets, e.g. XJTU).")
