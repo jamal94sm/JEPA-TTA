@@ -62,6 +62,7 @@ from models import (ContextEncoder, TargetEncoder, Predictor,
 from evaluate import run_full_eval
 from corruption import corrupt_images
 from gabor import GaborBank, patch_energy_descriptor, sanity_report, resolve_scales
+from hog import HOGBank
 
 from struct_loss import structure_loss, grad_conflict_cosine
 from sup_loss import supcon_loss, build_sup_head
@@ -89,6 +90,20 @@ def gabor_weight_at(epoch, cfg):
     if s == "ramp":
         return w0 * t
     raise ValueError(f"unknown gabor_schedule: {s}")
+
+def build_struct_bank(cfg):
+    """Fixed descriptor front-end for the structural target.
+    Both variants return (B, K, H, W) so the downstream descriptor,
+    heads, and losses are identical -- the only difference is the filter."""
+    per_channel = not bool(getattr(cfg, "gabor_gray", 1))
+    if getattr(cfg, "struct_target", "gabor") == "hog":
+        return HOGBank(n_bins=cfg.hog_bins,
+                       blur_sigmas=cfg.hog_sigmas,
+                       per_channel=per_channel)
+    return GaborBank(n_orient=cfg.gabor_orient,
+                     scales=resolve_scales(cfg.gabor_num_scales),
+                     gamma=cfg.gabor_gamma,
+                     per_channel=per_channel)
 
 
 def set_seed(seed):
@@ -167,12 +182,24 @@ def train_jepa(cfg, train_loader, eval_dict, id_map, n_classes):
     gabor_bank = struct_head = struct_head_a2 = task_weighter = None
 
     if use_struct:
+        
+      '''
         gabor_bank = GaborBank(
             n_orient=cfg.gabor_orient,
             scales=resolve_scales(cfg.gabor_num_scales), # scales=cfg.gabor_scales
             gamma=cfg.gabor_gamma,
             per_channel=not bool(getattr(cfg, "gabor_gray", 1)),
         ).to(cfg.device)
+        '''
+        gabor_bank = build_struct_bank(cfg).to(cfg.device)
+        mode = "per-channel RGB" if gabor_bank.per_channel else "grayscale"
+        if cfg.struct_target == "hog":
+            detail = f"{cfg.hog_bins} bins x {gabor_bank.n_scales} scales"
+        else:
+            detail = f"{cfg.gabor_orient} orient x {gabor_bank.n_scales} scales"
+        print(f"  Struct target: {cfg.struct_target}   K={gabor_bank.K} "
+              f"({detail}, {mode})")
+
         struct_head = StructureHead(
             cfg.embed_dim, gabor_bank.K,
             hidden=cfg.struct_head_hidden).to(cfg.device)
