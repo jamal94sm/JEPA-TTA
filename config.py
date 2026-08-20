@@ -97,7 +97,7 @@ def get_cfg(args=None):
                    help="1 = collapse to grayscale (correct for CASIA). "
                         "0 = per-channel Gabor (RGB datasets, e.g. XJTU).")
     p.add_argument("--gabor_scales", type=str,
-                   default='[[5,1.5,3.0],[9,3.0,6.0],[13,4.5,9.0]]',
+                   default='[[9,3,6],[15,5,10],[21,7,14]]',
                    help="JSON list of [kernel_size, sigma, lambda] triples "
                         "for the Gabor bank. Old default was "
                         "[[9,3,6],[15,5,10],[21,7,14]] -- that version let "
@@ -105,7 +105,7 @@ def get_cfg(args=None):
                         "default keeps max kernel size (13) below the patch "
                         "size (img_size/num_patches, 14px for the CASIA/XJTU "
                         "defaults) to stay patch-local. Re-derive the cap if "
-                        "you change --img_size or --num_patches.")
+                        "you change --img_size or --num_patches. try: [[5,1.5,3.0],[9,3.0,6.0],[13,4.5,9.0]]")
     p.add_argument("--gabor_log_every", type=int, default=5,
                    help="Print structural/diagnostic logs every N epochs.")
 
