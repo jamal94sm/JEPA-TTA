@@ -110,7 +110,7 @@ def get_arguments():
                               "(correct default here — STL/CIFAR/Tiny-ImageNet are RGB, "
                               "unlike CASIA-MS).")
     parser.add_argument('--gabor_scales',       type=str,
-                         default='[[5,1.5,3.0],[9,3.0,6.0],[13,4.5,9.0]]',
+                         default='[[9,3,6],[15,5,10],[21,7,14]]',
                          help="JSON list of [kernel_size, sigma, lambda] triples "
                               "for the Gabor bank. Old default was "
                               "[[9,3,6],[15,5,10],[21,7,14]] -- that version "
@@ -118,7 +118,7 @@ def get_arguments():
                               "new default keeps max kernel size (13) below "
                               "the patch size (image_size/num_patches, 16px "
                               "for the stl10/tiny-imagenet defaults) to stay "
-                              "patch-local. Re-derive the cap if you change "
+                              "patch-local. Re-derive the cap if you change. try: [[5,1.5,3.0],[9,3.0,6.0],[13,4.5,9.0]] "
                               "--image_size or --num_patches.")
     parser.add_argument('--gabor_log_every',    type=int,   default=5,
                          help="Print structural/diagnostic logs every N epochs.")
