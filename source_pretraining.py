@@ -61,7 +61,8 @@ from models import (ContextEncoder, TargetEncoder, Predictor,
 
 from evaluate import run_full_eval
 from corruption import corrupt_images
-from gabor import GaborBank, patch_energy_descriptor, sanity_report
+from gabor import GaborBank, patch_energy_descriptor, sanity_report, resolve_scales
+
 from struct_loss import structure_loss, grad_conflict_cosine
 from sup_loss import supcon_loss, build_sup_head
 
@@ -168,8 +169,8 @@ def train_jepa(cfg, train_loader, eval_dict, id_map, n_classes):
     if use_struct:
         gabor_bank = GaborBank(
             n_orient=cfg.gabor_orient,
-            scales=cfg.gabor_scales,
-            gamma=cfg.gabor_gamma,                            # NEW
+            scales=resolve_scales(cfg.gabor_num_scales), # scales=cfg.gabor_scales
+            gamma=cfg.gabor_gamma,
             per_channel=not bool(getattr(cfg, "gabor_gray", 1)),
         ).to(cfg.device)
         struct_head = StructureHead(
