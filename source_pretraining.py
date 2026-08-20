@@ -166,7 +166,7 @@ def train_jepa(cfg, train_loader, eval_dict, id_map, n_classes):
     gabor_bank = struct_head = struct_head_a2 = task_weighter = None
 
     if use_struct:
-            gabor_bank = GaborBank(
+        gabor_bank = GaborBank(
             n_orient=cfg.gabor_orient,
             scales=cfg.gabor_scales,
             gamma=cfg.gabor_gamma,                            # NEW
