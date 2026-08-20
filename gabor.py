@@ -5,6 +5,23 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+def gabor_kernel_pair(ksize, sigma, lambd, theta, gamma=0.25):
+    """Even (cos) + odd (sin) quadrature pair. Both zero-DC, unit-norm."""
+    half = ksize // 2
+    y, x = torch.meshgrid(
+        torch.arange(-half, half + 1, dtype=torch.float32),
+        torch.arange(-half, half + 1, dtype=torch.float32),
+        indexing="ij")
+    xr = x * math.cos(theta) + y * math.sin(theta)
+    yr = -x * math.sin(theta) + y * math.cos(theta)
+    env = torch.exp(-(xr ** 2 + (gamma ** 2) * (yr ** 2)) / (2 * sigma ** 2))
+    ke = env * torch.cos(2 * math.pi * xr / lambd)
+    ko = env * torch.sin(2 * math.pi * xr / lambd)
+    ke = ke - ke.mean()
+    ko = ko - ko.mean()
+    return (ke / (ke.norm() + 1e-8), ko / (ko.norm() + 1e-8))
+
+
 def gabor_kernel(ksize, sigma, lambd, theta, gamma=0.5, psi=0.0):
     half = ksize // 2
     y, x = torch.meshgrid(
