@@ -181,9 +181,7 @@ def train_jepa(cfg, train_loader, eval_dict, id_map, n_classes):
     use_struct = use_a1 or use_a2
     gabor_bank = struct_head = struct_head_a2 = task_weighter = None
 
-    if use_struct:
-        
-      '''
+    '''
         gabor_bank = GaborBank(
             n_orient=cfg.gabor_orient,
             scales=resolve_scales(cfg.gabor_num_scales), # scales=cfg.gabor_scales
@@ -191,6 +189,7 @@ def train_jepa(cfg, train_loader, eval_dict, id_map, n_classes):
             per_channel=not bool(getattr(cfg, "gabor_gray", 1)),
         ).to(cfg.device)
         '''
+    if use_struct:
         gabor_bank = build_struct_bank(cfg).to(cfg.device)
         mode = "per-channel RGB" if gabor_bank.per_channel else "grayscale"
         if cfg.struct_target == "hog":
