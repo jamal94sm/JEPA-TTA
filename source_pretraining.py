@@ -166,9 +166,10 @@ def train_jepa(cfg, train_loader, eval_dict, id_map, n_classes):
     gabor_bank = struct_head = struct_head_a2 = task_weighter = None
 
     if use_struct:
-        gabor_bank = GaborBank(
+            gabor_bank = GaborBank(
             n_orient=cfg.gabor_orient,
             scales=cfg.gabor_scales,
+            gamma=cfg.gabor_gamma,                            # NEW
             per_channel=not bool(getattr(cfg, "gabor_gray", 1)),
         ).to(cfg.device)
         struct_head = StructureHead(
@@ -314,7 +315,10 @@ def train_jepa(cfg, train_loader, eval_dict, id_map, n_classes):
             if use_struct:
                 with torch.no_grad():
                     desc = patch_energy_descriptor(
-                        gabor_bank(images), cfg.num_patches)   # CLEAN image
+                        gabor_bank(images), cfg.num_patches,
+                        img_size=cfg.img_size,
+                        ctx_mult=cfg.gabor_ctx_mult,
+                        center=bool(cfg.gabor_center))   # CLEAN image
 
                 if use_a1:
                     t_a1 = apply_masks(desc, ctx_masks)        # visible patches
