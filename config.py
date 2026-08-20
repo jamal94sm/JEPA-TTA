@@ -114,8 +114,8 @@ def get_cfg(args=None):
                    help="How many entries of the base scale ladder to use, "
                         "smallest kernels first. 3 = current default "
                         "[[5,1.5,3],[9,3,6],[13,4.5,9]].")
-
-
+    p.add_argument("--gabor_log_every", type=int, default=5,
+                   help="Print structural/diagnostic logs every N epochs.")
     
     # ─── Legacy A1 aliases (deprecated; prefer --struct_mode) ──
     p.add_argument("--use_gabor", type=int, default=0, choices=[0, 1],
