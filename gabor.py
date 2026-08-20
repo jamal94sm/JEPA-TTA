@@ -5,6 +5,21 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+
+BASE_SCALE_LADDER = (
+    (5, 1.5, 3.0),
+    (9, 3.0, 6.0),
+    (13, 4.5, 9.0),
+    (17, 6.0, 12.0),
+    (21, 7.5, 15.0),
+)
+
+def resolve_scales(num_scales):
+    """First `num_scales` entries of the base ladder, smallest kernel first."""
+    n = max(1, min(num_scales, len(BASE_SCALE_LADDER)))
+    return BASE_SCALE_LADDER[:n]
+    
+
 def gabor_kernel_pair(ksize, sigma, lambd, theta, gamma=0.25):
     """Even (cos) + odd (sin) quadrature pair. Both zero-DC, unit-norm."""
     half = ksize // 2
