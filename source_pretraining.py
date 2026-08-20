@@ -316,10 +316,7 @@ def train_jepa(cfg, train_loader, eval_dict, id_map, n_classes):
             if use_struct:
                 with torch.no_grad():
                     desc = patch_energy_descriptor(
-                        gabor_bank(images), cfg.num_patches,
-                        img_size=cfg.img_size,
-                        ctx_mult=cfg.gabor_ctx_mult,
-                        center=bool(cfg.gabor_center))   # CLEAN image
+                        gabor_bank(images), cfg.num_patches)   # CLEAN image
 
                 if use_a1:
                     t_a1 = apply_masks(desc, ctx_masks)        # visible patches
