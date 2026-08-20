@@ -107,8 +107,20 @@ def get_cfg(args=None):
                         "defaults) to stay patch-local. Re-derive the cap if "
                         "you change --img_size or --num_patches. try: [[5,1.5,3.0],[9,3.0,6.0],[13,4.5,9.0]]")
     p.add_argument("--gabor_log_every", type=int, default=5,
-                   help="Print structural/diagnostic logs every N epochs.")
+                   help="Print structural/diagnostic logs every N epochs.")    
+    p.add_argument("--gabor_orient", type=int, default=12)          # was 8
+    p.add_argument("--gabor_gamma", type=float, default=0.25,
+                   help="Envelope aspect. Smaller = more elongated ALONG the "
+                        "line orientation, so context follows crease geometry.")
+    p.add_argument("--gabor_ctx_mult", type=int, default=2,
+                   help="Descriptor pooling window in patch units. 1 = strictly "
+                        "patch-local; 2 = one-patch context on each side "
+                        "(approximates the large-kernel setting that worked).")
+    p.add_argument("--gabor_center", type=int, default=1, choices=[0, 1],
+                   help="Mean-center descriptors before L2 norm -- removes the "
+                        "shared positive-orthant component that inflates cosine.")
 
+    
     # ─── Legacy A1 aliases (deprecated; prefer --struct_mode) ──
     p.add_argument("--use_gabor", type=int, default=0, choices=[0, 1],
                    help="DEPRECATED alias for --struct_mode a1. "
