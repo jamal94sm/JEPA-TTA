@@ -9,6 +9,23 @@ import numpy as np
 import math
 
 
+class GaborInjector(nn.Module):
+    """Projects a visible-patch Gabor/HOG descriptor into embed_dim and fuses
+    it additively into context embeddings, gated by a learnable, small-
+    initialized scalar. Intended ONLY for the appearance-prediction path (A3)
+    -- never wire this into A2's structure query, since the input and A2's
+    target are the same modality and would let the model interpolate
+    locally instead of using ctx_embeds (a shortcut around the encoder)."""
+
+    def __init__(self, K, embed_dim, gate_init=0.1):
+        super().__init__()
+        self.proj = nn.Linear(K, embed_dim)
+        self.gate = nn.Parameter(torch.tensor(float(gate_init)))
+
+    def forward(self, ctx_embeds, desc_visible):
+        return ctx_embeds + torch.tanh(self.gate) * self.proj(desc_visible)
+
+
 class StructureHead(nn.Module):
     """Maps embeddings (embed_dim) -> Gabor descriptor space (out_dim).
 
