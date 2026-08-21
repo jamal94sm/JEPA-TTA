@@ -245,5 +245,6 @@ def get_cfg(args=None):
     # tuples directly) -- parse into the tuple-of-tuples GaborBank expects.
     cfg.gabor_scales = tuple(tuple(s) for s in json.loads(cfg.gabor_scales))
     cfg.hog_sigmas = tuple(json.loads(cfg.hog_sigmas))
+    cfg.use_a3 = bool(cfg.use_a3) and cfg.struct_mode != "none"   # NEW — needs a bank
 
     return cfg
