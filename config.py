@@ -156,6 +156,22 @@ def get_cfg(args=None):
                         "ctx_embeds. Changes the architecture: pass "
                         "--norm_struct_out 0 to reproduce earlier checkpoints.")
 
+    # ─── A3: visible-descriptor injection into APPEARANCE prediction only ──
+    p.add_argument("--use_a3", type=int, default=0, choices=[0, 1],
+                   help="1 = inject the visible-patch structural descriptor "
+                        "(Gabor or HOG, per --struct_target) into the context "
+                        "fed to the predictor's APPEARANCE query only. Never "
+                        "affects A2's structure query -- injecting the same "
+                        "modality there would let the model interpolate "
+                        "locally instead of using ctx_embeds, defeating A2's "
+                        "purpose. Requires --struct_mode != none (the "
+                        "descriptor bank must exist).")
+    p.add_argument("--gabor_inject_gate_init", type=float, default=0.1,
+                   help="Initial value of A3's learnable gate (passed through "
+                        "tanh). Small and learnable so training starts close "
+                        "to the current baseline and only opens the channel "
+                        "if useful.")
+    
     # ─── Structural loss form ─────────────────────────────────
     p.add_argument("--struct_loss", default="cosine",
                    choices=["cosine", "infonce", "smooth_l1"],
