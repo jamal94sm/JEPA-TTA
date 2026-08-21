@@ -14,7 +14,9 @@ collide (e.g. ./output_jepa vs ./output_compnet).
 JEPA add-ons (all default OFF, so the plain flags reproduce the original
 baseline exactly):
   --use_corruption 1  : domain-shift corruption applied to the CONTEXT view only
-  --struct_mode a1/a2/both : Gabor line-structure auxiliary loss(es)
+  --struct_mode a1/a2/both : structural auxiliary loss(es)
+  --struct_target gabor/hog : which fixed descriptor produces the structural
+                        target (see build_struct_bank)
   --use_supervision 1 : supervised identity term (SupCon / ArcFace / CE) on
                         pooled context embeddings, using source-domain labels
 
@@ -38,8 +40,8 @@ nohup python source_pretraining.py --method jepa \
   --data_dir /home/pai-ng/Jamal/XJTU-UP \
   --mode cross_domain_openset --train_spectrums iPhone_Nature \
   --use_corruption 1 --gabor_gray 0 --struct_mode a2 --struct_loss infonce --w_a2 0.3 \
-  --use_supervision 1 --sup_loss supcon --w_sup 0.1 --batch_size 256 \
-  --output_dir ./output_jepa_a2_supcon > JepaA2Supcon.log 2>&1 &
+  --struct_target hog --hog_bins 8 --hog_sigmas '[0.0,1.0,2.0]' \
+  --output_dir ./out_xjtu_a2_hog > xjtu_a2_hog.log 2>&1 &
 
 """
 
@@ -91,6 +93,7 @@ def gabor_weight_at(epoch, cfg):
         return w0 * t
     raise ValueError(f"unknown gabor_schedule: {s}")
 
+
 def build_struct_bank(cfg):
     """Fixed descriptor front-end for the structural target.
     Both variants return (B, K, H, W) so the downstream descriptor,
@@ -104,6 +107,17 @@ def build_struct_bank(cfg):
                      scales=resolve_scales(cfg.gabor_num_scales),
                      gamma=cfg.gabor_gamma,
                      per_channel=per_channel)
+
+
+def struct_bank_detail(cfg, bank):
+    """Human-readable description of the structural target front-end,
+    used in the single merged startup log line (no duplication)."""
+    mode = "per-channel RGB" if bank.per_channel else "grayscale"
+    if cfg.struct_target == "hog":
+        detail = f"{cfg.hog_bins} bins x {bank.n_scales} scales"
+    else:
+        detail = f"{cfg.gabor_orient} orient x {bank.n_scales} scales"
+    return mode, detail
 
 
 def set_seed(seed):
@@ -181,23 +195,8 @@ def train_jepa(cfg, train_loader, eval_dict, id_map, n_classes):
     use_struct = use_a1 or use_a2
     gabor_bank = struct_head = struct_head_a2 = task_weighter = None
 
-    '''
-        gabor_bank = GaborBank(
-            n_orient=cfg.gabor_orient,
-            scales=resolve_scales(cfg.gabor_num_scales), # scales=cfg.gabor_scales
-            gamma=cfg.gabor_gamma,
-            per_channel=not bool(getattr(cfg, "gabor_gray", 1)),
-        ).to(cfg.device)
-        '''
     if use_struct:
         gabor_bank = build_struct_bank(cfg).to(cfg.device)
-        mode = "per-channel RGB" if gabor_bank.per_channel else "grayscale"
-        if cfg.struct_target == "hog":
-            detail = f"{cfg.hog_bins} bins x {gabor_bank.n_scales} scales"
-        else:
-            detail = f"{cfg.gabor_orient} orient x {gabor_bank.n_scales} scales"
-        print(f"  Struct target: {cfg.struct_target}   K={gabor_bank.K} "
-              f"({detail}, {mode})")
 
         struct_head = StructureHead(
             cfg.embed_dim, gabor_bank.K,
@@ -228,12 +227,16 @@ def train_jepa(cfg, train_loader, eval_dict, id_map, n_classes):
         if cfg.task_weighting == "uncertainty":
             task_weighter = UncertaintyWeighting(n_tasks).to(cfg.device)
 
+    # ─── Single, merged startup log for the structural block ──────
+    # (previously printed twice: once branching on struct_target, once
+    # hardcoded to Gabor-only wording -- that duplicate/dead block is
+    # removed here in favor of one struct_target-aware summary.)
     if use_struct:
-        mode = "per-channel RGB" if gabor_bank.per_channel else "grayscale"
+        mode, detail = struct_bank_detail(cfg, gabor_bank)
         head_mode = ("separate" if struct_head_a2 is not struct_head
                      else "shared")
-        print(f"  Gabor bank: K={gabor_bank.K} "
-              f"({cfg.gabor_orient} orient x {gabor_bank.n_scales} scales, {mode})")
+        print(f"  Struct target: {cfg.struct_target}   K={gabor_bank.K} "
+              f"({detail}, {mode})")
         print(f"  Structure head: {n_sh/1e6:.3f}M params  "
               f"(hidden={cfg.struct_head_hidden} -> {gabor_bank.K}, {head_mode})")
         print(f"  Struct out norm: {'ON' if cfg.norm_struct_out else 'OFF'}")
@@ -380,7 +383,8 @@ def train_jepa(cfg, train_loader, eval_dict, id_map, n_classes):
 
                 if epoch == 1 and n_bat == 0:
                     rep = sanity_report(gabor_bank, images, cfg.num_patches)
-                    print("\n  ── Structural sanity check (epoch 1, batch 0) ──")
+                    print(f"\n  ── Structural sanity check ({cfg.struct_target}, "
+                          f"epoch 1, batch 0) ──")
                     for k, v in rep.items():
                         print(f"      {k}: {v}")
                     if rep["desc_pair_cos"] > 0.95:
@@ -389,7 +393,7 @@ def train_jepa(cfg, train_loader, eval_dict, id_map, n_classes):
                     if not (0.99 < rep["desc_norm_mean"] < 1.01):
                         print("      !! WARNING: descriptor norms != 1.0.")
                     if rep["resp_absmean"] < 1e-6:
-                        print("      !! WARNING: Gabor responses ~0.")
+                        print("      !! WARNING: responses ~0.")
                     print()
 
             # ─── Supervised identity term ───
@@ -559,6 +563,7 @@ def train_jepa(cfg, train_loader, eval_dict, id_map, n_classes):
                         ckpt["struct_head_a2"] = struct_head_a2.state_dict()
                     ckpt["struct_cfg"] = {
                         "struct_mode": cfg.struct_mode,
+                        "struct_target": cfg.struct_target,
                         "struct_head_mode": cfg.struct_head_mode,
                         "norm_struct_out": int(cfg.norm_struct_out),
                         "loss_a1": cfg.loss_a1,
@@ -566,7 +571,8 @@ def train_jepa(cfg, train_loader, eval_dict, id_map, n_classes):
                         "w_a1": cfg.w_a1, "w_a2": cfg.w_a2,
                         "task_weighting": cfg.task_weighting,
                         "gabor_orient": cfg.gabor_orient,
-                        "gabor_K": gabor_bank.K,
+                        "hog_bins": cfg.hog_bins,
+                        "struct_K": gabor_bank.K,
                         "per_channel": gabor_bank.per_channel,
                     }
                     if task_weighter is not None:
@@ -602,6 +608,7 @@ def train_jepa(cfg, train_loader, eval_dict, id_map, n_classes):
                 "aug_multiplier": cfg.aug_multiplier,
                 "use_corruption": int(getattr(cfg, "use_corruption", 0)),
                 "struct_mode": cfg.struct_mode,
+                "struct_target": cfg.struct_target,
                 "loss_a1": cfg.loss_a1,
                 "loss_a2": cfg.loss_a2,
                 "struct_head_mode": cfg.struct_head_mode,
@@ -613,6 +620,7 @@ def train_jepa(cfg, train_loader, eval_dict, id_map, n_classes):
                 "infonce_temp": float(cfg.infonce_temp),
                 "gabor_orient": int(cfg.gabor_orient),
                 "gabor_gray": int(getattr(cfg, "gabor_gray", 1)),
+                "hog_bins": int(cfg.hog_bins),
                 "use_supervision": int(use_sup),
                 "sup_loss": cfg.sup_loss,
                 "w_sup": float(cfg.w_sup),
