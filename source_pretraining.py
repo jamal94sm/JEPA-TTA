@@ -17,6 +17,9 @@ baseline exactly):
   --struct_mode a1/a2/both : structural auxiliary loss(es)
   --struct_target gabor/hog : which fixed descriptor produces the structural
                         target (see build_struct_bank)
+  --use_a3 1           : inject the visible-patch structural descriptor into
+                        the predictor's APPEARANCE query only (see
+                        GaborInjector). Never affects A2's structure query.
   --use_supervision 1 : supervised identity term (SupCon / ArcFace / CE) on
                         pooled context embeddings, using source-domain labels
 
@@ -40,8 +43,8 @@ nohup python source_pretraining.py --method jepa \
   --data_dir /home/pai-ng/Jamal/XJTU-UP \
   --mode cross_domain_openset --train_spectrums iPhone_Nature \
   --use_corruption 1 --gabor_gray 0 --struct_mode a2 --struct_loss infonce --w_a2 0.3 \
-  --struct_target hog --hog_bins 8 --hog_sigmas '[0.0,1.0,2.0]' \
-  --output_dir ./out_xjtu_a2_hog > xjtu_a2_hog.log 2>&1 &
+  --use_a3 1 --gabor_inject_gate_init 0.1 \
+  --output_dir ./out_xjtu_a2_a3 > xjtu_a2_a3.log 2>&1 &
 
 """
 
@@ -59,7 +62,8 @@ from dataset import build_datasets
 from models import (ContextEncoder, TargetEncoder, Predictor,
                     FeatureExtractor, patchify, apply_masks,
                     repeat_interleave_batch, update_ema, CompNet, PlainViT,
-                    FeatModule, StructureHead, UncertaintyWeighting)
+                    FeatModule, StructureHead, UncertaintyWeighting,
+                    GaborInjector)
 
 from evaluate import run_full_eval
 from corruption import corrupt_images
@@ -214,6 +218,16 @@ def train_jepa(cfg, train_loader, eval_dict, id_map, n_classes):
         if struct_head_a2 is not struct_head:
             n_sh += sum(p.numel() for p in struct_head_a2.parameters())
 
+    # ─── A3: visible-descriptor injection into appearance prediction ──────
+    gabor_injector = None
+    if use_struct and bool(getattr(cfg, "use_a3", False)):
+        gabor_injector = GaborInjector(
+            gabor_bank.K, cfg.embed_dim,
+            gate_init=cfg.gabor_inject_gate_init).to(cfg.device)
+        print(f"  A3 (appearance injection): ON  "
+              f"gate_init={cfg.gabor_inject_gate_init}  "
+              f"params={sum(p.numel() for p in gabor_injector.parameters())}")
+
     # ─── Supervised identity term (uses source-domain labels) ─────
     use_sup = bool(getattr(cfg, "use_supervision", 0)) and cfg.w_sup > 0
     sup_head = None
@@ -228,9 +242,6 @@ def train_jepa(cfg, train_loader, eval_dict, id_map, n_classes):
             task_weighter = UncertaintyWeighting(n_tasks).to(cfg.device)
 
     # ─── Single, merged startup log for the structural block ──────
-    # (previously printed twice: once branching on struct_target, once
-    # hardcoded to Gabor-only wording -- that duplicate/dead block is
-    # removed here in favor of one struct_target-aware summary.)
     if use_struct:
         mode, detail = struct_bank_detail(cfg, gabor_bank)
         head_mode = ("separate" if struct_head_a2 is not struct_head
@@ -253,6 +264,7 @@ def train_jepa(cfg, train_loader, eval_dict, id_map, n_classes):
 
     print(f"  Corruption: {'ON' if getattr(cfg, 'use_corruption', 0) else 'OFF'}"
           f"   Structural: {'ON' if use_struct else 'OFF'}"
+          f"   A3: {'ON' if gabor_injector is not None else 'OFF'}"
           f"   Supervision: {'ON' if use_sup else 'OFF'}")
 
     train_params = list(context_encoder.parameters()) + list(predictor.parameters())
@@ -264,6 +276,9 @@ def train_jepa(cfg, train_loader, eval_dict, id_map, n_classes):
         train_params += list(sup_head.parameters())
     if task_weighter is not None:
         train_params += list(task_weighter.parameters())
+    if gabor_injector is not None:
+        train_params += list(gabor_injector.parameters())
+
     opt = torch.optim.AdamW(train_params, lr=cfg.learning_rate,
                             weight_decay=cfg.weight_decay)
 
@@ -293,6 +308,8 @@ def train_jepa(cfg, train_loader, eval_dict, id_map, n_classes):
                 struct_head_a2.train()
         if sup_head is not None:
             sup_head.train()
+        if gabor_injector is not None:
+            gabor_injector.train()
 
         ep_loss = 0.0          # raw JEPA term only — comparable across runs
         ep_var = 0.0
@@ -302,6 +319,7 @@ def train_jepa(cfg, train_loader, eval_dict, id_map, n_classes):
         ep_sup = ep_sup_aux = 0.0
         n_sup = 0
         ep_conflict = float("nan")
+        ep_a3_gate = 0.0
         n_bat = 0
         t0 = time.time()
 
@@ -326,27 +344,57 @@ def train_jepa(cfg, train_loader, eval_dict, id_map, n_classes):
                 z_flat = ctx_embeds.reshape(-1, ctx_embeds.size(-1))
                 ep_var += z_flat.var(dim=0).mean().item()
 
+            # ─── D1: compute the clean-image structural descriptor BEFORE
+            # the predictor call, so A3 can use it for the appearance query.
+            # Previously this lived inside `if use_struct:` further below,
+            # after the predictor had already run -- too late for A3.
+            desc = None
+            if use_struct:
+                with torch.no_grad():
+                    desc = patch_energy_descriptor(
+                        gabor_bank(images), cfg.num_patches)   # CLEAN image
+
+            # A3: fuse the VISIBLE-patch descriptor into ctx_embeds for the
+            # appearance-prediction path only. ctx_embeds itself is left
+            # untouched, so A2's structure query (below) still reads the
+            # unfused embedding -- see GaborInjector's docstring for why.
+            ctx_for_pred = ctx_embeds
+            if gabor_injector is not None:
+                with torch.no_grad():
+                    desc_visible = apply_masks(desc, ctx_masks)   # visible only
+                ctx_for_pred = gabor_injector(ctx_embeds, desc_visible)
+                ep_a3_gate += torch.tanh(gabor_injector.gate).item()
+
             with torch.no_grad():
                 tgt_full = target_encoder(images)
                 tgt_embeds = apply_masks(tgt_full, tgt_masks)
                 tgt_embeds = repeat_interleave_batch(
                     tgt_embeds, B, repeat=len(ctx_masks))
 
-            # A2 requests the extra structure query from the shared predictor.
+            # ─── D2: appearance query uses ctx_for_pred (A3-fused if
+            # enabled); A2's structure query MUST use the unfused
+            # ctx_embeds. When A3 is off, ctx_for_pred is ctx_embeds, so
+            # this collapses back to a single predictor call exactly as
+            # before -- no change in behaviour for existing configs.
             if use_a2:
-                pred_embeds, struct_hidden = predictor(
-                    ctx_embeds, ctx_masks, tgt_masks, predict_structure=True)
+                if gabor_injector is not None:
+                    pred_embeds, _ = predictor(
+                        ctx_for_pred, ctx_masks, tgt_masks,
+                        predict_structure=True)
+                    _, struct_hidden = predictor(
+                        ctx_embeds, ctx_masks, tgt_masks,
+                        predict_structure=True)
+                else:
+                    pred_embeds, struct_hidden = predictor(
+                        ctx_embeds, ctx_masks, tgt_masks,
+                        predict_structure=True)
             else:
-                pred_embeds = predictor(ctx_embeds, ctx_masks, tgt_masks)
+                pred_embeds = predictor(ctx_for_pred, ctx_masks, tgt_masks)
 
             loss_jepa = F.smooth_l1_loss(pred_embeds, tgt_embeds)
 
             l_a1 = l_a2 = None
             if use_struct:
-                with torch.no_grad():
-                    desc = patch_energy_descriptor(
-                        gabor_bank(images), cfg.num_patches)   # CLEAN image
-
                 if use_a1:
                     t_a1 = apply_masks(desc, ctx_masks)        # visible patches
                     if epoch == 1 and n_bat == 0:
@@ -394,6 +442,15 @@ def train_jepa(cfg, train_loader, eval_dict, id_map, n_classes):
                         print("      !! WARNING: descriptor norms != 1.0.")
                     if rep["resp_absmean"] < 1e-6:
                         print("      !! WARNING: responses ~0.")
+                    if gabor_injector is not None:
+                        assert desc_visible.shape[:2] == ctx_embeds.shape[:2], (
+                            f"A3 misalignment: desc_visible "
+                            f"{tuple(desc_visible.shape)} vs ctx_embeds "
+                            f"{tuple(ctx_embeds.shape)}")
+                        print(f"      A3 desc_visible shape: "
+                              f"{tuple(desc_visible.shape)}  "
+                              f"(matches ctx_embeds visible-patch count: "
+                              f"{'yes' if desc_visible.shape[:2] == ctx_embeds.shape[:2] else 'NO'})")
                     print()
 
             # ─── Supervised identity term ───
@@ -478,6 +535,7 @@ def train_jepa(cfg, train_loader, eval_dict, id_map, n_classes):
         ep_a2_top1 /= max(n_a2, 1)
         ep_sup /= max(n_sup, 1)
         ep_sup_aux /= max(n_sup, 1)
+        ep_a3_gate /= max(n_bat, 1)
         elapsed = time.time() - t0
         lr_now = scheduler.get_last_lr()[0]
 
@@ -498,6 +556,8 @@ def train_jepa(cfg, train_loader, eval_dict, id_map, n_classes):
             if use_a2:
                 print(f"           A2 (hidden):  loss={ep_a2:.4f}  "
                       f"cos={ep_a2_cos:.3f}  top1={ep_a2_top1:.3f}")
+            if gabor_injector is not None:
+                print(f"           A3 (inject):  gate={ep_a3_gate:+.4f}")
             if use_sup:
                 aux = "acc" if cfg.sup_loss in ("arcface", "ce") else "pos/anchor"
                 print(f"           SUP ({cfg.sup_loss}): loss={ep_sup:.4f}  "
@@ -526,6 +586,8 @@ def train_jepa(cfg, train_loader, eval_dict, id_map, n_classes):
                 eval_entry["l_a2"] = ep_a2
                 eval_entry["a2_cos"] = ep_a2_cos
                 eval_entry["a2_top1"] = ep_a2_top1
+            if gabor_injector is not None:
+                eval_entry["a3_gate"] = ep_a3_gate
             if use_sup:
                 eval_entry["l_sup"] = ep_sup
                 eval_entry["sup_aux"] = ep_sup_aux
@@ -577,6 +639,12 @@ def train_jepa(cfg, train_loader, eval_dict, id_map, n_classes):
                     }
                     if task_weighter is not None:
                         ckpt["task_weighter"] = task_weighter.state_dict()
+                if gabor_injector is not None:
+                    ckpt["gabor_injector"] = gabor_injector.state_dict()
+                    ckpt["a3_cfg"] = {
+                        "use_a3": 1,
+                        "gabor_inject_gate_init": cfg.gabor_inject_gate_init,
+                    }
                 if sup_head is not None:
                     ckpt["sup_head"] = sup_head.state_dict()
                 if use_sup:
@@ -621,6 +689,9 @@ def train_jepa(cfg, train_loader, eval_dict, id_map, n_classes):
                 "gabor_orient": int(cfg.gabor_orient),
                 "gabor_gray": int(getattr(cfg, "gabor_gray", 1)),
                 "hog_bins": int(cfg.hog_bins),
+                "use_a3": int(gabor_injector is not None),
+                "gabor_inject_gate_init": float(
+                    getattr(cfg, "gabor_inject_gate_init", 0.1)),
                 "use_supervision": int(use_sup),
                 "sup_loss": cfg.sup_loss,
                 "w_sup": float(cfg.w_sup),
