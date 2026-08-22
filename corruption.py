@@ -7,6 +7,30 @@ import torchvision.transforms.functional as TF
 CORRUPTION_NAMES = ["color_temp", "gamma", "channel_mix", "desaturate", "blur", "noise", "vignette"]
 
 
+class _MildCorruptionCfg:
+    """Wraps cfg to build a milder, target-safe severity profile without
+    duplicating corrupt_images. Scales every *_strength by
+    cfg.target_corruption_scale, uses cfg.target_corruption_prob for the
+    gating probability, and zeroes the two destructive types (blur,
+    desaturate) so the target never becomes an unreliable anchor."""
+
+    def __init__(self, cfg):
+        s = float(getattr(cfg, "target_corruption_scale", 0.3))
+        self.corruption_prob = float(getattr(cfg, "target_corruption_prob", 0.3))
+        self.corruption_mode = cfg.corruption_mode
+        self.mix_prob = cfg.mix_prob
+        self.color_temp_strength = cfg.color_temp_strength * s
+        self.gamma_strength = cfg.gamma_strength * s
+        self.channel_mix_strength = cfg.channel_mix_strength * s
+        self.desaturate_strength = 0.0          # destructive -- excluded
+        self.blur_sigma_max = 0.0                # destructive -- excluded
+        self.corruption_std = cfg.corruption_std * s
+        self.vignette_strength = cfg.vignette_strength * s
+
+
+def build_target_corruption_cfg(cfg):
+    return _MildCorruptionCfg(cfg)
+
 def _denorm(x, mean, std):
     mean = x.new_tensor(mean).view(1, -1, 1, 1)
     std = x.new_tensor(std).view(1, -1, 1, 1)
