@@ -81,7 +81,7 @@ def get_cfg(args=None):
                    help="1 = apply domain-shift corruption to the JEPA context "
                         "view during training; 0 = standard JEPA (no corruption).")
     p.add_argument("--corruption_prob", type=float, default=0.5)
-    p.add_argument("--corruption_mode", default="single", choices=["single", "mixed"])
+    p.add_argument("--corruption_mode", default="mixed", choices=["single", "mixed"])
     p.add_argument("--mix_prob", type=float, default=0.4)
     p.add_argument("--color_temp_strength", type=float, default=0.1)
     p.add_argument("--gamma_strength", type=float, default=0.3)
@@ -91,6 +91,23 @@ def get_cfg(args=None):
     p.add_argument("--corruption_std", type=float, default=0.01)
     p.add_argument("--vignette_strength", type=float, default=0.05)
 
+    # ─── Target-side corruption (ablation: mild, independent) ─────
+    p.add_argument("--use_target_corruption", type=int, default=0, choices=[0, 1],
+                   help="1 = apply a SEPARATE, milder, independently-sampled "
+                        "corruption to the image fed to target_encoder, "
+                        "instead of the clean image. Ablation only -- the "
+                        "default design (clean target) is what forces "
+                        "domain-invariant representations; see discussion. "
+                        "Ignored when 0 (target stays clean).")
+    p.add_argument("--target_corruption_scale", type=float, default=0.3,
+                   help="Multiplier applied to every *_strength value when "
+                        "building the target-side severity profile, e.g. "
+                        "0.3 = 30% of the context-corruption severities.")
+    p.add_argument("--target_corruption_prob", type=float, default=0.3,
+                   help="Per-sample probability of the TARGET being corrupted "
+                        "at all (independent draw from the context's "
+                        "--corruption_prob).")
+    
     # ─── Gabor filter bank (shared by A1 and A2) ──────────────
     p.add_argument("--gabor_gray", type=int, default=1, choices=[0, 1],
                    help="1 = collapse to grayscale (correct for CASIA). "
